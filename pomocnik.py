@@ -262,7 +262,8 @@ def autostart_ustaw(wlaczony):
                 os.remove(PLIST)
         elif SYSTEM == 'Windows':
             import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KLUCZ_RUN, 0, winreg.KEY_SET_VALUE) as klucz:
+            # CreateKeyEx otwiera klucz albo go tworzy (na świeżym koncie może jeszcze nie istnieć).
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, KLUCZ_RUN, 0, winreg.KEY_SET_VALUE) as klucz:
                 if wlaczony:
                     winreg.SetValueEx(klucz, 'PomocnikRezerwacji', 0, winreg.REG_SZ,
                                       subprocess.list2cmdline(polecenie_startowe()))
