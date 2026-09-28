@@ -841,6 +841,17 @@ def uruchom(w_tle):
         if not w_tle:
             webbrowser.open(adres)
         return
+    if SYSTEM == 'Darwin' and os.environ.get('POMOCNIK_LAUNCHER') and not w_tle:
+        # Kliknięcie ikony na Macu: czuwanie startuje jako osobny proces w tle, a ten się kończy.
+        # Inaczej macOS uznaje aplikację za wciąż otwartą i kolejne kliknięcia nic nie robią.
+        subprocess.Popen(polecenie_startowe(), start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(40):
+            time.sleep(0.25)
+            if juz_dziala():
+                break
+        webbrowser.open(adres)
+        return
     try:
         serwer = ThreadingHTTPServer(('127.0.0.1', PORT), Obsluga)
     except OSError:
