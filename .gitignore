@@ -1,0 +1,9 @@
+dist/
+build/
+*.spec
+__pycache__/
+stare/
+.claude/
+ikona.png
+ikona.ico
+.DS_Store
