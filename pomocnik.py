@@ -38,7 +38,7 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-WERSJA = '4.0'
+WERSJA = '4.0.1'
 NAZWA = 'Pomocnik rezerwacji'
 PORT = int(os.environ.get('POMOCNIK_PORT', 47631))  # inny port tylko do testów
 SYSTEM = platform.system()  # 'Darwin' | 'Windows' | 'Linux'
