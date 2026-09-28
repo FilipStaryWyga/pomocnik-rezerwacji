@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pomocnik rezerwacji – Auschwitz-Birkenau
 // @namespace    visit-auschwitz-autofill
-// @version      4.0
+// @version      4.0.1
 // @description  Szablony formularza „Zwiedzanie grupowe”, dziennik zgłoszeń i automatyczne ponowne wypełnienie po odrzuceniu (współpracuje z programem Pomocnik rezerwacji). CAPTCHA i „Wyślij” zostają dla człowieka.
 // @match        https://visit.auschwitz.org/formularz.html*
 // @grant        GM_getValue
@@ -255,13 +255,9 @@
 
     // Źródło danych: kopia formularza z pierwotnego zapytania → albo szablon automatu → albo pierwszy szablon.
     const tpls = load(TPL_KEY, {});
+    // Bez szablonu i tak wypełniamy to, co wiadomo z maila (temat, język, data, godzina).
     const base = cur.formularz || tpls[load(TPL_AUTO_KEY, '')] || Object.values(tpls)[0];
-    if (!base) {
-      banner(ev, 'Brak zapisanego szablonu – uzupełnij formularz ręcznie i zapisz go jako szablon na przyszłość.');
-      alarm(ev);
-      return;
-    }
-    const tpl = JSON.parse(JSON.stringify(base));
+    const tpl = base ? JSON.parse(JSON.stringify(base)) : { fields: {}, kontrahenci: [], offset2: 1 };
     const f = tpl.fields;
     const temat = optionByText(P + 'id_tematu', ev.rodzaj);
     const jezyk = optionByText(P + 'id_jezyka', ev.jezyk);
@@ -271,6 +267,7 @@
 
     const missing = await fillForm(tpl, ev.data, true);
     const uwagi = [];
+    if (!base) uwagi.push('brak zapisanego szablonu – uzupełnij brakujące pola, a po wysłaniu zapisz formularz jako szablon');
     if (ev.rodzaj && !temat) uwagi.push(`nie znaleziono rodzaju „${ev.rodzaj}” – sprawdź temat`);
     if (!jezyk) uwagi.push(`nie znaleziono języka „${ev.jezyk}” – sprawdź język`);
     if (missing.length) uwagi.push('brakuje: ' + missing.join(', '));
