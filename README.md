@@ -40,4 +40,9 @@ CAPTCHA („Nie jestem robotem”) i przycisk „Wyślij” zawsze zostają dla 
 3. GitHub zbuduje i przetestuje plik. Link do pobrania zawsze wskazuje najnowszą wersję:
    `https://github.com/<konto>/<repozytorium>/releases/latest/download/PomocnikRezerwacji.exe`
 
-Klient uruchamia pobrany plik – program instaluje się sam, a przy nowszej wersji aktualizuje.
+Klient uruchamia pobrany plik – program instaluje się sam, a przy nowszej wersji aktualizuje
+(ustawienia i hasło zostają).
+
+Program nigdy sam nie pobiera ani nie instaluje nowych wersji. Co kilka godzin sprawdza tylko na GitHubie,
+czy jest nowsze wydanie, i wtedy raz powiadamia (telefon + komputer). Na stronie ustawień pojawia się
+przycisk „Pobierz” z linkiem powyżej. Powiadomienia można wyłączyć w sekcji 5 strony ustawień.

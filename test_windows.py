@@ -122,6 +122,25 @@ try:
 except Exception as e:
     sprawdz('brakujący folder', 'Wysłane' in str(e) and 'INBOX' in str(e), e)
 
+# Nowe wersje: porównanie wersji i odczyt odpowiedzi GitHuba
+sprawdz('porównanie wersji', p.wersja_krotka('v4.1') == p.wersja_krotka('4.1.0') < p.wersja_krotka('4.1.1')
+        < p.wersja_krotka('v4.10') and p.wersja_krotka('4.0.1') < p.wersja_krotka(p.WERSJA))
+wydanie = {'tag_name': 'v9.1', 'assets': [{'name': 'inny.zip'}, {'name': 'PomocnikRezerwacji.exe'}]}
+sprawdz('wydanie z plikiem .exe', p.wersja_wydania(wydanie) == '9.1', p.wersja_wydania(wydanie))
+sprawdz('wydanie testowe pomijane', p.wersja_wydania({**wydanie, 'prerelease': True}) is None)
+sprawdz('wydanie bez pliku .exe', p.wersja_wydania({'tag_name': 'v9', 'assets': []}) is None)
+
+# Powiadomienie o nowej wersji przychodzi raz na wersję.
+powiadomienia = []
+p.wyslij_na_telefon = lambda k, tytul, tresc, pilne: powiadomienia.append(tytul)
+p.powiadom_system = lambda tytul, tresc: None
+nw = p.NoweWersje()
+nw.stan.update(najnowsza='9.1', nowsza=True)
+nw.powiadom(); nw.powiadom()
+nw.stan.update(najnowsza='9.2')
+nw.powiadom()
+sprawdz('powiadomienie raz na wersję', len(powiadomienia) == 2 and '9.2' in powiadomienia[-1], powiadomienia)
+
 sprawdz('dźwięki systemowe', len(p.dostepne_dzwieki()) > 0, p.dostepne_dzwieki())
 p.powiadom_system('Test', 'Test powiadomienia')
 p.zagraj_alarm(p.konfig(), 1)
@@ -173,6 +192,10 @@ sprawdz('sprawdzenie bez serwera IMAP', 'serwer' in post('/api/sprawdz', {'imap_
 sprawdz('zapis błędnej liczby', post('/api/ustawienia', {'co_ile_sekund': 'abc'})['ok'] and p.konfig()['co_ile_sekund'] == 5)
 get('/status?v=9.9.9')
 stan = json.loads(get('/api/stan')[1])
+sprawdz('stan nowej wersji', 'nowa_wersja' in stan and 'powiadamiaj_o_wersji' in stan['ustawienia']
+        and stan['nowa_wersja']['adres'].endswith('/releases/latest/download/PomocnikRezerwacji.exe'))
+if p.SYSTEM != 'Windows':
+    sprawdz('sprawdzanie wersji tylko na Windowsie', not post('/api/sprawdz-wersje', {})['ok'])
 sprawdz('wersja skryptu z Chrome', stan['skrypt_chrome_wersja'] == '9.9.9' and stan['skrypt_wersja'] == p.WERSJA_SKRYPTU)
 
 serwer.shutdown()

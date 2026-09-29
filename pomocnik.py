@@ -44,6 +44,8 @@ PORT = int(os.environ.get('POMOCNIK_PORT', 47631))  # inny port tylko do testów
 SYSTEM = platform.system()  # 'Darwin' | 'Windows' | 'Linux'
 SERWIS_HASLA = 'auschwitz-pomocnik'
 ADRES_FORMULARZA = 'https://visit.auschwitz.org/formularz.html'
+REPO_GITHUB = 'FilipStaryWyga/pomocnik-rezerwacji'   # gdzie sprawdzać nowe wersje (wydania z plikiem .exe)
+ADRES_POBRANIA = f'https://github.com/{REPO_GITHUB}/releases/latest/download/PomocnikRezerwacji.exe'
 ALARM_PO_MINUTACH_BEZ_POLACZENIA = 10
 TEMAT_ODRZUCENIA = re.compile(
     r'Odrzucenie zapytania.*?(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\s*-\s*(.+?)\s*$', re.I | re.S)
@@ -123,6 +125,7 @@ DOMYSLNE = {
     'glosnosc': 80,                 # 0–100
     'powtorzenia': 3,
     'alarm_bez_polaczenia': True,   # powiadom, gdy program nie może połączyć się z pocztą przez dłuższy czas
+    'powiadamiaj_o_wersji': True,   # Windows: powiadom, gdy na GitHubie jest nowsza wersja do pobrania
 }
 
 
@@ -831,6 +834,88 @@ class Czuwanie(threading.Thread):
 
 
 czuwanie = Czuwanie()
+
+
+# ---------- Nowe wersje (Windows) ----------
+# Program tylko sprawdza i powiadamia. Niczego sam nie pobiera ani nie uruchamia – nową wersję
+# pobiera człowiek (link na stronie ustawień), a uruchomiony plik podmienia zainstalowany.
+
+NAZWA_EXE = 'PomocnikRezerwacji.exe'
+
+
+def wersja_krotka(w):
+    """„v4.1” → (4, 1, 0, 0), żeby porównywać wersje liczbowo."""
+    liczby = [int(x) for x in re.findall(r'\d+', str(w or ''))[:4]]
+    return tuple(liczby + [0] * (4 - len(liczby)))
+
+
+def wersja_wydania(dane):
+    """Wersja z odpowiedzi GitHuba o najnowszym wydaniu – tylko gotowego i z plikiem .exe."""
+    if not isinstance(dane, dict) or dane.get('draft') or dane.get('prerelease'):
+        return None
+    if not any(plik.get('name') == NAZWA_EXE for plik in dane.get('assets') or []):
+        return None
+    return str(dane.get('tag_name') or '').lstrip('vV') or None
+
+
+def sprawdzaj_wersje():
+    """Wydania na GitHubie to plik .exe – sprawdzanie ma sens tylko w wersji na Windows."""
+    return SYSTEM == 'Windows' and getattr(sys, 'frozen', False)
+
+
+class NoweWersje(threading.Thread):
+    CO_ILE = 6 * 3600
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.teraz = threading.Event()
+        self.stan = {'mozliwe': sprawdzaj_wersje(), 'najnowsza': None, 'nowsza': False,
+                     'sprawdzono': None, 'blad': None, 'adres': ADRES_POBRANIA}
+
+    def sprawdz(self):
+        req = urllib.request.Request(f'https://api.github.com/repos/{REPO_GITHUB}/releases/latest',
+                                     headers={'User-Agent': f'PomocnikRezerwacji/{WERSJA}',
+                                              'Accept': 'application/vnd.github+json'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            najnowsza = wersja_wydania(json.load(r))
+        self.stan.update(najnowsza=najnowsza,
+                         nowsza=bool(najnowsza) and wersja_krotka(najnowsza) > wersja_krotka(WERSJA),
+                         sprawdzono=datetime.now().astimezone().isoformat(timespec='seconds'), blad=None)
+
+    def powiadom(self):
+        """Raz na każdą nową wersję: telefon i powiadomienie na komputerze."""
+        k = konfig()
+        if not (self.stan['nowsza'] and k['powiadamiaj_o_wersji']):
+            return
+        with blokada:
+            stan = wczytaj_json(PLIK_STAN, {})
+            if stan.get('powiadomiono_o_wersji') == self.stan['najnowsza']:
+                return
+            stan['powiadomiono_o_wersji'] = self.stan['najnowsza']
+            zapisz_json(PLIK_STAN, stan)
+        tytul = f'Nowa wersja Pomocnika rezerwacji: {self.stan["najnowsza"]}'
+        tresc = 'Pobierz ją na stronie ustawień programu i uruchom pobrany plik – ustawienia zostaną zachowane.'
+        log(tytul)
+        wyslij_na_telefon(k, tytul, tresc, False)
+        powiadom_system(tytul, tresc)
+
+    def run(self):
+        if not self.stan['mozliwe']:
+            return
+        if self.teraz.wait(120):        # pierwsze sprawdzenie chwilę po starcie
+            self.teraz.clear()
+        while True:
+            try:
+                self.sprawdz()
+                self.powiadom()
+            except Exception as e:
+                self.stan['blad'] = przyjazny_blad(e)
+                log('Sprawdzanie nowej wersji – błąd:', self.stan['blad'])
+            self.teraz.wait(self.CO_ILE)
+            self.teraz.clear()
+
+
+nowe_wersje = NoweWersje()
 # Kiedy skrypt w Chrome ostatnio odezwał się do programu i w jakiej wersji.
 skrypt_chrome = {'ostatnio': None, 'wersja': None}
 
@@ -865,6 +950,7 @@ def stan_publiczny():
         'skrypt_chrome_wersja': skrypt_chrome['wersja'],
         'skrypt_wersja': WERSJA_SKRYPTU,
         'chrome': bool(znajdz_chrome()),
+        'nowa_wersja': nowe_wersje.stan,
         'zdarzenia': list(reversed(zdarzenia[-30:])),
     }
 
@@ -1003,6 +1089,12 @@ class Obsluga(BaseHTTPRequestHandler):
                 threading.Thread(target=nowe_zdarzenie, args=(konfig(), zd), daemon=True).start()
                 return self._json(200, {'ok': True, 'id': zd['id']})
 
+            if sciezka == '/api/sprawdz-wersje':
+                if not nowe_wersje.stan['mozliwe']:
+                    return self._json(400, {'ok': False, 'komunikat': 'Sprawdzanie nowych wersji działa w wersji na Windows.'})
+                nowe_wersje.teraz.set()
+                return self._json(200, {'ok': True})
+
             if sciezka == '/api/zakoncz':
                 self._json(200, {'ok': True})
                 log('Zamknięto program ze strony ustawień.')
@@ -1084,6 +1176,7 @@ def uruchom(w_tle):
         autostart_ustaw(True)   # odświeża ścieżkę, gdyby program przeniesiono
     log(f'{NAZWA} {WERSJA} uruchomiony. Strona ustawień: {adres}')
     czuwanie.start()
+    nowe_wersje.start()
     if not w_tle:
         threading.Timer(0.8, lambda: webbrowser.open(adres)).start()
     try:
@@ -1170,6 +1263,7 @@ STRONA = r'''<!DOCTYPE html>
     }
   }
   *{box-sizing:border-box}
+  [hidden]{display:none!important}
   body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
   .wrap{max-width:880px;margin:0 auto;padding:32px 16px 64px}
   header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
@@ -1385,6 +1479,10 @@ STRONA = r'''<!DOCTYPE html>
         <label class="tgl"><input type="checkbox" id="autostart" data-auto><i></i></label></div>
       <div class="switch"><div class="t"><b>Ostrzegaj o problemach z pocztą</b><span>Powiadomienie, gdy przez 10 minut nie da się sprawdzić skrzynki</span></div>
         <label class="tgl"><input type="checkbox" id="alarm_bez_polaczenia" data-auto><i></i></label></div>
+      <div class="switch" id="wersja-box"><div class="t"><b>Powiadamiaj o nowych wersjach</b><span id="wersja-txt">Powiadomienie na telefonie i komputerze, gdy będzie nowa wersja do pobrania</span></div>
+        <a class="btn primary" id="pobierz" target="_blank" rel="noopener" hidden>Pobierz</a>
+        <button id="sprawdz-wersje">Sprawdź teraz</button>
+        <label class="tgl"><input type="checkbox" id="powiadamiaj_o_wersji" data-auto><i></i></label></div>
       <div class="switch"><div class="t"><b>Zakończ program</b><span>Czuwanie zostanie wyłączone do następnego uruchomienia</span></div>
         <button class="danger" id="zakoncz">Zakończ</button></div>
       <div class="switch"><div class="t"><b>Odinstaluj</b><span id="odinstaluj-opis">Usuwa autostart, skróty, ustawienia i zapisane hasło</span></div>
@@ -1447,7 +1545,23 @@ async function odswiez(){
     pokazStan('err', 'Program nie działa', 'Uruchom Pomocnika rezerwacji ponownie.');
     return;
   }
+  // Po aktualizacji programu wczytaj stronę od nowa – nowa wersja może mieć nowe opcje.
+  if (window.WERSJA_STRONY && window.WERSJA_STRONY !== s.wersja) return location.reload();
+  window.WERSJA_STRONY = s.wersja;
   $('wersja').textContent = 'wersja ' + s.wersja;
+  const nw = s.nowa_wersja;
+  $('wersja-box').hidden = !nw.mozliwe;
+  if (nw.mozliwe) {
+    $('wersja-txt').textContent = nw.nowsza
+      ? `Dostępna wersja ${nw.najnowsza}. Kliknij „Pobierz” i uruchom pobrany plik – program zaktualizuje się, ustawienia zostaną.`
+      : nw.blad ? 'Nie udało się sprawdzić nowej wersji: ' + nw.blad
+      : nw.sprawdzono ? `Masz najnowszą wersję (sprawdzono ${temu(nw.sprawdzono)}).`
+      : 'Powiadomienie na telefonie i komputerze, gdy będzie nowa wersja do pobrania.';
+    $('pobierz').hidden = !nw.nowsza;
+    $('pobierz').href = nw.adres;
+    $('sprawdz-wersje').hidden = nw.nowsza;
+    $('wersja').textContent += nw.nowsza ? ` · dostępna ${nw.najnowsza}` : '';
+  }
   window.OS = s.system;
   const u = s.ustawienia;
   const opoznienie = s.ostatnie_sprawdzenie ? (Date.now() - Date.parse(s.ostatnie_sprawdzenie)) / 1000 : 0;
@@ -1474,7 +1588,7 @@ async function odswiez(){
 
   if (!wczytano) {
     for (const p of POLA) { const el = $(p), v = u[p]; if (el.type === 'checkbox') el.checked = !!v; else el.value = Array.isArray(v) ? v.join(', ') : v; }
-    for (const p of ['telefon','otwieraj_formularz','alarm_bez_polaczenia']) $(p).checked = !!u[p];
+    for (const p of ['telefon','otwieraj_formularz','alarm_bez_polaczenia','powiadamiaj_o_wersji']) $(p).checked = !!u[p];
     $('autostart').checked = s.autostart;
     $('dzwiek').innerHTML = s.dzwieki.map(d => `<option>${esc(d)}</option>`).join('');
     $('dzwiek').value = u.dzwiek;
@@ -1539,6 +1653,12 @@ $('proba').onclick = async () => {
   const r = await api('/api/proba', {data: $('p-data').value, godzina: $('p-godzina').value, jezyk: $('p-jezyk').value, rodzaj: $('p-rodzaj').value});
   msg('msg-proba', r.ok ? 'Alarm uruchomiony.' : (r.komunikat || 'Błąd.'), r.ok ? 'ok' : 'err');
   setTimeout(odswiez, 1000);
+};
+$('sprawdz-wersje').onclick = async () => {
+  const r = await api('/api/sprawdz-wersje', {});
+  if (!r.ok) return alert(r.komunikat || 'Nie udało się.');
+  $('wersja-txt').textContent = 'Sprawdzanie…';
+  setTimeout(odswiez, 3000);
 };
 $('zakoncz').onclick = async () => {
   if (!confirm('Zakończyć program? Odrzucenia nie będą wykrywane, dopóki go ponownie nie uruchomisz.')) return;

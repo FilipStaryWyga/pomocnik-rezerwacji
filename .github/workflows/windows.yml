@@ -35,7 +35,7 @@ jobs:
           python -m pip install --upgrade pyinstaller
           pyinstaller --onefile --noconsole --name PomocnikRezerwacji --icon ikona.ico --add-data "pomocnik.user.js;." pomocnik.py
 
-      - name: Test gotowego .exe (instalacja, autostart, skróty, serwer)
+      - name: Test gotowego .exe (instalacja, autostart, skróty, serwer, aktualizacja)
         shell: pwsh
         run: |
           Start-Process -FilePath dist\PomocnikRezerwacji.exe -ArgumentList '--w-tle'
@@ -53,6 +53,28 @@ jobs:
           Write-Host "Autostart: $($run.PomocnikRezerwacji)"
           $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Pomocnik rezerwacji.lnk'
           if (-not (Test-Path $lnk)) { Write-Error 'Brak skrótu w menu Start'; exit 1 }
+
+          # Ręczna aktualizacja: użytkownik pobiera nową wersję (np. do Pobranych) i uruchamia ją,
+          # gdy stara jeszcze działa. Pobrany plik ma zamknąć starą, podmienić plik i uruchomić się na jej miejscu.
+          $stary = (Get-NetTCPConnection -LocalPort 47631 -State Listen | Select-Object -First 1).OwningProcess
+          $pobrane = Join-Path $env:TEMP 'Pobrane'
+          New-Item -ItemType Directory -Force $pobrane | Out-Null
+          Copy-Item dist\PomocnikRezerwacji.exe (Join-Path $pobrane 'PomocnikRezerwacji.exe')
+          Start-Process -FilePath (Join-Path $pobrane 'PomocnikRezerwacji.exe') -ArgumentList '--w-tle'
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 1
+            $nowy = (Get-NetTCPConnection -LocalPort 47631 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
+            if ($nowy -and $nowy -ne $stary) {
+              try { $r = Invoke-RestMethod http://127.0.0.1:47631/api/stan; $ok = $true; break } catch {}
+            }
+          }
+          if (-not $ok) { Write-Error 'Pobrana wersja nie zastąpiła działającego programu'; exit 1 }
+          $sciezka = (Get-Process -Id $nowy).Path
+          if ($sciezka -ne $exe) { Write-Error "Po aktualizacji działa zła kopia: $sciezka"; exit 1 }
+          Write-Host "Aktualizacja działa: proces $stary zastąpiony przez $nowy ($sciezka)"
+          if (-not $r.nowa_wersja.mozliwe) { Write-Error 'Brak sprawdzania nowych wersji'; exit 1 }
+
           Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{}' http://127.0.0.1:47631/api/zakoncz | Out-Null
           Write-Host 'Instalacja i uruchomienie działają.'
 
@@ -68,4 +90,6 @@ jobs:
           files: dist/PomocnikRezerwacji.exe
           body: |
             Pobierz **PomocnikRezerwacji.exe** i uruchom. Program sam się zainstaluje i otworzy stronę ustawień.
+            Aktualizacja: pobierz nowy plik tak samo i uruchom go – ustawienia zostaną zachowane.
+            Program (od wersji 4.1) sam powiadamia na telefonie i komputerze, gdy pojawi się nowa wersja.
             Jeśli Windows pokaże „System Windows ochronił ten komputer”, kliknij „Więcej informacji”, a potem „Uruchom mimo to”.
