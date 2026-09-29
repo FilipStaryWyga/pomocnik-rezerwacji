@@ -9,6 +9,18 @@ w Państwowym Muzeum Auschwitz-Birkenau. Gdy przyjdzie odrzucenie:
 
 CAPTCHA („Nie jestem robotem”) i przycisk „Wyślij” zawsze zostają dla człowieka.
 
+## Jak części programu współpracują
+
+- **Strona ustawień** (http://127.0.0.1:47631) – stan czuwania, lista wiadomości z muzeum,
+  przycisk „Otwórz formularz rezerwacji” i „Wypełnij ponownie” przy każdym odrzuceniu
+  (otwiera Chrome z formularzem wypełnionym tym terminem). Kafelki stanu prowadzą do właściwych sekcji;
+  kafelek „Skrypt w Chrome” pokazuje, gdy skrypt jest nieaktualny.
+- **Panel w Chrome** (na visit.auschwitz.org) – szablony i dziennik zgłoszeń. Odrzucenia z poczty same
+  trafiają do dziennika, a potwierdzenia z terminem w temacie można jednym kliknięciem oznaczyć jako
+  przydzielone. Karta otwarta wcześniej pokazuje baner „Wypełnij teraz” zamiast nadpisywać formularz.
+  Ikona koła zębatego otwiera stronę ustawień. Zmiany w jednej karcie od razu widać w pozostałych.
+- **Telefon** (ntfy) – alarm o odrzuceniu z najwyższym priorytetem; próbne alarmy mają dopisek „PRÓBA”.
+
 ## Pliki
 
 | Plik | Do czego |
@@ -23,6 +35,7 @@ CAPTCHA („Nie jestem robotem”) i przycisk „Wyślij” zawsze zostają dla 
 ## Nowa wersja na Windows
 
 1. Zmień `WERSJA` w `pomocnik.py` (i `@version` w `pomocnik.user.js`, jeśli zmienił się skrypt).
+   Sprawdź zmiany testami: `python3 test_windows.py` (działa też na Macu).
 2. Wypchnij zmiany i tag, np. `git tag v4.1 && git push --tags`.
 3. GitHub zbuduje i przetestuje plik. Link do pobrania zawsze wskazuje najnowszą wersję:
    `https://github.com/<konto>/<repozytorium>/releases/latest/download/PomocnikRezerwacji.exe`

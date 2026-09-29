@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Pomocnik rezerwacji – Auschwitz-Birkenau
 // @namespace    visit-auschwitz-autofill
-// @version      4.0.1
+// @version      4.1.0
 // @description  Szablony formularza „Zwiedzanie grupowe”, dziennik zgłoszeń i automatyczne ponowne wypełnienie po odrzuceniu (współpracuje z programem Pomocnik rezerwacji). CAPTCHA i „Wyślij” zostają dla człowieka.
 // @match        https://visit.auschwitz.org/formularz.html*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
+// @grant        GM_addValueChangeListener
+// @grant        GM_info
 // @connect      127.0.0.1
 // @updateURL    http://127.0.0.1:47631/pomocnik.user.js
 // @downloadURL  http://127.0.0.1:47631/pomocnik.user.js
@@ -28,14 +30,26 @@
   const DONE_KEY = 'obsluzone_zdarzenia';   // { idZdarzenia: znacznikCzasu }
   const CLAIM_KEY = 'zajete_zdarzenia';     // { idZdarzenia: { karta, czas } } – żeby dwie karty nie wypełniały tego samego
   const MIN_KEY = 'panel_zwiniety';
+  const SYNC_KEY = 'zsynchronizowane_zdarzenia'; // { idZdarzenia: znacznikCzasu } – odrzucenia już przeniesione do dziennika
   const HELPER = 'http://127.0.0.1:47631';
-  const TAB_ID = Math.random().toString(36).slice(2);
+  const WERSJA = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '';
+  // Identyfikator karty przetrwa odświeżenie strony (np. po wygaśnięciu sesji) – inaczej odrzucenie
+  // „zajęte” przed odświeżeniem przez 10 minut nie dałoby się wypełnić w tej samej karcie.
+  const TAB_ID = (() => {
+    const nowy = Math.random().toString(36).slice(2);
+    try {
+      const id = sessionStorage.getItem('pomocnik_karta') || nowy;
+      sessionStorage.setItem('pomocnik_karta', id);
+      return id;
+    } catch { return nowy; }
+  })();
 
   const STATUS = {
     wyslane:      { nazwa: 'Czeka',        klasa: 'wait' },
     przydzielone: { nazwa: 'Przydzielone', klasa: 'ok' },
     odrzucone:    { nazwa: 'Odrzucone',    klasa: 'err' },
   };
+  const st = s => STATUS[s] || STATUS.wyslane; // odporne na wpisy z uszkodzonej / starej kopii
 
   // Pola, których nie zapisujemy w szablonie (data jest wybierana osobno, reszta to CAPTCHA/techniczne).
   const SKIP = new Set([
@@ -50,17 +64,27 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const norm = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
-  const addDays = (iso, n) => { const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); };
+
   const dayDiff = (a, b) => Math.round((new Date(b + 'T12:00:00') - new Date(a + 'T12:00:00')) / 864e5);
   const plDate = iso => iso.split('-').reverse().join('.');
   const weekday = iso => ['nd', 'pn', 'wt', 'śr', 'cz', 'pt', 'sb'][new Date(iso + 'T12:00:00').getDay()];
-  const today = () => new Date().toISOString().slice(0, 10);
+  // Data lokalna (toISOString podaje czas UTC – w Polsce po północy dawałby wczorajszy dzień).
+  const isoLocal = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const today = () => isoLocal(new Date());
+  const addDays = (iso, n) => { const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() + n); return isoLocal(d); };
+  const isProba = ev => String(ev.id).startsWith('proba');
+  const pruneMap = (map, max) => { // zostawia najnowsze wpisy { klucz: znacznikCzasu }
+    const keys = Object.keys(map).sort((a, b) => map[a] - map[b]);
+    keys.slice(0, Math.max(0, keys.length - max)).forEach(k => delete map[k]);
+    return map;
+  };
 
   const ICON = {
     check: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M3 8.5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     x: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
     trash: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     min: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 8h8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+    gear: '<svg viewBox="0 0 16 16" width="14" height="14"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.8v1.8M8 12.4v1.8M1.8 8h1.8M12.4 8h1.8M3.6 3.6l1.3 1.3M11.1 11.1l1.3 1.3M3.6 12.4l1.3-1.3M11.1 4.9l1.3-1.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
     max: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 10l4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   };
 
@@ -82,7 +106,7 @@
     const date = form[P + 'data'].value;
     const captchaOk = (form['g-recaptcha-response'] || {}).value;
     const valid = typeof $(form).valid === 'function' ? $(form).valid() : true;
-    const blad = $('#blad-formularza').html();
+    const blad = $('#blad-formularza').text().trim();
     if (!date || !captchaOk || !valid || blad) return;
 
     const log = getLog();
@@ -94,7 +118,7 @@
         status: 'wyslane',
         proba: ((cur && cur.proba) || 0) + 1,
         szablon: biezaceZdarzenie ? 'po odrzuceniu' : (selTpl.value || ''),
-        godzina: form[P + 'godzina'].value,
+        godzina: (form[P + 'godzina'] || {}).value || '',
         wyslano: new Date().toISOString(),
         formularz: readForm(), // kopia wszystkich pól – użyjemy jej przy ewentualnym kolejnym odrzuceniu
       };
@@ -102,6 +126,8 @@
     }
     save(LAST_DATE_KEY, date);
     if (biezaceZdarzenie) markDone(biezaceZdarzenie.id);
+    biezaceZdarzenie = null;
+    refreshAll(); // strona może wysyłać bez przeładowania – panel ma od razu pokazać nowy stan
   });
 
   // ---------- Odczyt / zapis formularza ----------
@@ -117,7 +143,7 @@
       id: $(box).find('.kontrahent.selected').data('id') ?? null,
     })).filter(k => k.id != null);
 
-    const d1 = form[P + 'data'].value, d2 = form[P + 'data2'].value;
+    const d1 = form[P + 'data'].value, d2 = (form[P + 'data2'] || {}).value;
     const offset2 = d1 && d2 ? dayDiff(d1, d2) : 1;
     return { fields, kontrahenci, offset2 };
   }
@@ -138,6 +164,20 @@
     if (!el || !text) return null;
     const exact = [...el.options].find(o => norm(o.dataset.orig || o.text) === norm(text));
     return exact ? exact.value : null;
+  }
+
+  // Godzina z maila („9:00”) może mieć w liście inny zapis („09:00”, „09:00:00”) – szukamy pasującej opcji.
+  const timeKey = t => { const m = String(t || '').match(/(\d{1,2})[:.](\d{2})/); return m ? m[1].padStart(2, '0') + ':' + m[2] : null; };
+  async function setTime(name, time) {
+    const el = form.elements[name];
+    if (!el || !time) return;
+    if (el.tagName !== 'SELECT') return setField(name, time);
+    const want = timeKey(time);
+    for (let i = 0; i < 15; i++) { // lista godzin może doładowywać się dopiero po wybraniu daty
+      const o = [...el.options].find(o => o.value && (timeKey(o.value) === want || timeKey(o.text) === want));
+      if (o) { if (el.value !== o.value) setField(name, o.value); return; }
+      await sleep(200);
+    }
   }
 
   async function fillForm(tpl, date, silent) {
@@ -162,13 +202,18 @@
       if ([...d2.options].some(o => o.value === second)) setField(P + 'data2', second);
     }
 
+    // Godziny ustawiamy jeszcze raz po dacie – lista godzin zależy zwykle od wybranego dnia.
+    await setTime(P + 'godzina', f[P + 'godzina']);
+    if (d2 && $(d2).is(':visible')) await setTime(P + 'godzina2', f[P + 'godzina2']);
+
     save(LAST_DATE_KEY, date);
     await sleep(400);
+    if (!form[P + 'godzina'] || !form[P + 'godzina'].value) await setTime(P + 'godzina', f[P + 'godzina']);
     if (typeof window.PrzeliczWartosc === 'function') window.PrzeliczWartosc();
 
     const missing = checkMissing();
     const cap = document.querySelector('.g-recaptcha') || form[P + 'submit'];
-    cap.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (cap) cap.scrollIntoView({ behavior: 'smooth', block: 'center' });
     if (!silent) status(missing.length
       ? 'Brakuje: ' + missing.join(', ')
       : `Wypełniono na ${plDate(date)}. Zaznacz CAPTCHA i kliknij „Wyślij”.`, missing.length ? 'err' : 'ok');
@@ -202,56 +247,104 @@
   function markDone(id) {
     const done = load(DONE_KEY, {});
     done[id] = Date.now();
-    const keys = Object.keys(done).sort((a, b) => done[a] - done[b]);
-    keys.slice(0, Math.max(0, keys.length - 300)).forEach(k => delete done[k]);
-    save(DONE_KEY, done);
+    save(DONE_KEY, pruneMap(done, 300));
   }
 
+  // Czy wersja a jest nowsza od b (np. „4.1.0” > „4.0.1”).
+  const newer = (a, b) => {
+    const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    }
+    return false;
+  };
+
   async function checkHelper() {
-    const s = await helper('/status');
+    const s = await helper('/status?v=' + encodeURIComponent(WERSJA));
     const el = q('.pr-conn');
+    const ustawienia = `<a href="${HELPER}/" target="_blank" rel="noopener">Ustawienia</a>`;
     if (!s) {
       el.className = 'pr-conn off';
-      el.innerHTML = '<i></i><span>Program nie działa – uruchom Pomocnika rezerwacji</span>';
+      el.innerHTML = '<i></i><span>Program nie działa – uruchom Pomocnika rezerwacji (ikona na pulpicie lub w menu Start / Aplikacjach)</span>';
     } else if (!s.polaczono) {
       el.className = 'pr-conn warn';
-      el.innerHTML = `<i></i><span>Brak połączenia z pocztą${s.blad ? ': ' + esc(s.blad) : ''}</span>`;
+      el.innerHTML = `<i></i><span>Brak połączenia z pocztą${s.blad ? ': ' + esc(s.blad) : ''}</span>${ustawienia}`;
     } else {
       const t = s.ostatnie_sprawdzenie ? new Date(s.ostatnie_sprawdzenie).toLocaleTimeString('pl-PL') : '–';
       el.className = 'pr-conn ok';
-      el.innerHTML = `<i></i><span>Czuwa nad ${esc(s.login)} · ${t}</span>`;
+      el.innerHTML = `<i></i><span>Czuwa nad ${esc(s.login)} · ${t}</span>${ustawienia}`;
+    }
+    const upd = q('.pr-update');
+    upd.hidden = !(s && s.skrypt_wersja && WERSJA && newer(s.skrypt_wersja, WERSJA));
+    if (!upd.hidden) upd.innerHTML = `Jest nowsza wersja skryptu (${esc(s.skrypt_wersja)}). <a href="${HELPER}/pomocnik.user.js" target="_blank" rel="noopener">Zaktualizuj</a>, a potem odśwież stronę.`;
+  }
+
+  // Odrzucenie trafia do dziennika raz na zdarzenie – ręcznie usunięty wpis nie wraca przy każdym odświeżeniu.
+  function applyRejection(ev) {
+    if (isProba(ev) || !ev.data) return;
+    const synced = load(SYNC_KEY, {});
+    if (synced[ev.id]) return;
+    synced[ev.id] = Date.now();
+    save(SYNC_KEY, pruneMap(synced, 300));
+    const cur = getLog()[ev.data];
+    // Termin już przydzielony albo zapytanie wysłane ponownie po tym odrzuceniu – nie cofamy statusu.
+    if (cur && (cur.status === 'przydzielone' ||
+        (cur.status === 'wyslane' && cur.wyslano && Date.parse(cur.wyslano) > Date.parse(ev.czas)))) return;
+    setEntry(ev.data, { status: 'odrzucone', proba: (cur && cur.proba) || 1, odrzucono: ev.czas,
+      godzina: (cur && cur.godzina) || ev.godzina, ...(cur ? {} : { szablon: 'z maila' }) });
+  }
+
+  // Pobiera wiadomości od programu: przenosi odrzucenia do dziennika, pokazuje inne maile,
+  // a przy otwarciu strony wypełnia formularz nieobsłużonym odrzuceniem.
+  async function pollEvents(first) {
+    const res = await helper('/zdarzenia?v=' + encodeURIComponent(WERSJA));
+    if (!res || !Array.isArray(res.zdarzenia)) return;
+    const all = res.zdarzenia;
+    const now = Date.now();
+    all.filter(e => e.typ === 'odrzucenie').forEach(applyRejection);
+
+    const done = load(DONE_KEY, {});
+    showInfo(all.filter(e => e.typ === 'inny' && !done[e.id] && now - Date.parse(e.czas) < 7 * 864e5).reverse());
+
+    const claims = load(CLAIM_KEY, {});
+    if (biezaceZdarzenie) { // ta karta obsługuje odrzucenie – odnawiamy „zajęcie”, żeby inne karty go nie ruszały
+      claims[biezaceZdarzenie.id] = { karta: TAB_ID, czas: now };
+      save(CLAIM_KEY, claims);
+      return;
+    }
+    const open = all.filter(e => e.typ === 'odrzucenie' && !done[e.id] && now - Date.parse(e.czas) < 12 * 3600e3);
+    const free = e => !claims[e.id] || claims[e.id].karta === TAB_ID || now - claims[e.id].czas > 10 * 60e3;
+
+    if (first) {
+      const wanted = (location.hash.match(/pomocnik=([\w-]+)/) || [])[1];
+      if (wanted) history.replaceState(null, '', location.pathname + location.search);
+      // Wskazane przez program lub „Wypełnij ponownie” na stronie ustawień – także starsze albo pominięte.
+      const ev = (wanted && all.find(e => e.id === wanted && e.typ === 'odrzucenie')) || open.find(free);
+      if (ev) await startRejection(ev, open.filter(e => e.id !== ev.id).length);
+      return;
+    }
+    // Karta otwarta wcześniej: nie nadpisujemy formularza bez pytania. Czekamy chwilę, aż karta
+    // otwarta przez program zdąży zająć odrzucenie – wtedy tu nic się nie pokaże.
+    const ev = open.find(e => free(e) && now - Date.parse(e.czas) > 20e3);
+    const b = document.getElementById('pr-banner');
+    if (ev && (!b || b.dataset.id !== ev.id)) {
+      banner(ev, { czeka: true });
+      alarm(ev);
     }
   }
 
-  // Po otwarciu strony: czy jest nieobsłużone odrzucenie? Jeśli tak – wypełnij formularz tym samym terminem.
-  async function autoProcess() {
-    const res = await helper('/zdarzenia');
-    if (!res) return;
-    const done = load(DONE_KEY, {});
+  async function startRejection(ev, pozostale) {
     const claims = load(CLAIM_KEY, {});
-    const now = Date.now();
-    const wanted = (location.hash.match(/pomocnik=([\w-]+)/) || [])[1];
-
-    const inne = res.zdarzenia.filter(e => e.typ === 'inny' && !done[e.id]);
-    if (inne.length) showInfo(inne);
-
-    const open = res.zdarzenia.filter(e =>
-      e.typ === 'odrzucenie' && !done[e.id] && now - Date.parse(e.czas) < 12 * 3600e3);
-    const free = e => !claims[e.id] || claims[e.id].karta === TAB_ID || now - claims[e.id].czas > 10 * 60e3;
-    const ev = (wanted && open.find(e => e.id === wanted)) || open.find(free);
-    if (!ev) return;
-
-    claims[ev.id] = { karta: TAB_ID, czas: now };
+    for (const [id, c] of Object.entries(claims)) if (Date.now() - c.czas > 864e5) delete claims[id];
+    claims[ev.id] = { karta: TAB_ID, czas: Date.now() };
     save(CLAIM_KEY, claims);
-    history.replaceState(null, '', location.pathname + location.search);
-    await handleRejection(ev, open.length - 1);
+    await handleRejection(ev, pozostale);
   }
 
   async function handleRejection(ev, pozostale) {
     biezaceZdarzenie = ev;
-    const log = getLog();
-    const cur = log[ev.data] || {};
-    setEntry(ev.data, { ...cur, status: 'odrzucone', proba: cur.proba || 1, odrzucono: ev.czas, godzina: cur.godzina || ev.godzina });
+    applyRejection(ev);
+    const cur = getLog()[ev.data] || {};
 
     // Źródło danych: kopia formularza z pierwotnego zapytania → albo szablon automatu → albo pierwszy szablon.
     const tpls = load(TPL_KEY, {});
@@ -271,33 +364,42 @@
     if (ev.rodzaj && !temat) uwagi.push(`nie znaleziono rodzaju „${ev.rodzaj}” – sprawdź temat`);
     if (!jezyk) uwagi.push(`nie znaleziono języka „${ev.jezyk}” – sprawdź język`);
     if (missing.length) uwagi.push('brakuje: ' + missing.join(', '));
-    if (pozostale > 0) uwagi.push(`czekają jeszcze inne odrzucenia (${pozostale}) – po wysłaniu odśwież stronę`);
-    banner(ev, uwagi.join('; '));
+    if (pozostale > 0) uwagi.push(`czekają jeszcze inne odrzucenia (${pozostale}) – po wysłaniu otwórz formularz ponownie`);
+    banner(ev, { uwaga: uwagi.join('; ') });
     alarm(ev);
   }
 
-  function banner(ev, uwaga) {
+  function banner(ev, { uwaga = '', czeka = false } = {}) {
     let b = document.getElementById('pr-banner');
     if (!b) {
       b = document.createElement('div');
       b.id = 'pr-banner';
       document.body.prepend(b);
     }
+    b.dataset.id = ev.id;
+    const proba = isProba(ev);
+    const tekst = czeka
+      ? 'Kliknij „Wypełnij teraz”, aby wpisać ten termin do formularza (obecne dane w formularzu zostaną zastąpione).'
+      : proba
+        ? 'To tylko próba – formularz wypełniono jak po prawdziwym odrzuceniu. Nie wysyłaj, kliknij „Pomiń”.'
+        : 'Formularz wypełniono ponownie tym samym terminem. Zaznacz „Nie jestem robotem” i kliknij „Wyślij”.';
     b.innerHTML = `
       <div class="pr-b-body">
-        <div class="pr-b-title">Odrzucono termin ${plDate(ev.data)}, ${esc(ev.godzina)} · ${esc(ev.jezyk)}</div>
-        <div class="pr-b-text">Formularz wypełniono ponownie tym samym terminem. Zaznacz „Nie jestem robotem” i kliknij „Wyślij”.</div>
+        <div class="pr-b-title">${proba ? 'PRÓBA – ' : ''}Odrzucono termin ${plDate(ev.data)}, ${esc(ev.godzina)} · ${esc(ev.jezyk)}</div>
+        <div class="pr-b-text">${tekst}</div>
         ${uwaga ? `<div class="pr-b-note">${esc(uwaga)}</div>` : ''}
       </div>
+      ${czeka ? '<button type="button" class="pr-b-fill">Wypełnij teraz</button>' : ''}
       <button type="button" class="pr-b-skip">Pomiń</button>`;
     panel.style.top = (b.offsetHeight + 16) + 'px'; // panel pod paskiem, żeby nie zasłaniał „Pomiń”
+    const close = () => { b.remove(); panel.style.top = ''; };
     b.querySelector('.pr-b-skip').onclick = () => {
       markDone(ev.id);
-      biezaceZdarzenie = null;
-      b.remove();
-      panel.style.top = '';
+      if (biezaceZdarzenie && biezaceZdarzenie.id === ev.id) biezaceZdarzenie = null;
+      close();
       status(`Pominięto odrzucenie z ${plDate(ev.data)}.`, 'ok');
     };
+    if (czeka) b.querySelector('.pr-b-fill').onclick = () => { close(); startRejection(ev, 0); };
   }
 
   function alarm(ev) {
@@ -312,7 +414,7 @@
       });
     } catch { /* bez dźwięku */ }
     if (typeof GM_notification === 'function') {
-      GM_notification({ title: `Odrzucono ${plDate(ev.data)}, ${ev.godzina}`,
+      GM_notification({ title: `${isProba(ev) ? 'PRÓBA – ' : ''}Odrzucono ${plDate(ev.data)}, ${ev.godzina}`,
         text: 'Formularz jest gotowy – zaznacz CAPTCHA i wyślij.', onclick: () => window.focus() });
     }
     const orig = document.title;
@@ -323,17 +425,29 @@
     }, 800);
   }
 
+  // Inne wiadomości z muzeum (np. potwierdzenia). Gdy w temacie jest termin, można go jednym
+  // kliknięciem oznaczyć w dzienniku jako przydzielony.
   function showInfo(inne) {
     const el = q('.pr-info');
-    el.hidden = false;
-    el.innerHTML = '<div class="pr-info-h">Nowe wiadomości z muzeum</div>' + inne.map(e =>
-      `<div class="pr-info-row"><span>${esc(e.temat_maila)}</span><button type="button" class="pr-icon" data-id="${esc(e.id)}" title="Ukryj">${ICON.x}</button></div>`).join('');
+    const html = inne.length ? '<div class="pr-info-h">Nowe wiadomości z muzeum</div>' + inne.map(e => {
+      const ok = e.data ? `<button type="button" class="pr-icon" data-act="ok" data-id="${esc(e.id)}" data-date="${esc(e.data)}" title="Oznacz ${plDate(e.data)} w dzienniku jako przydzielone">${ICON.check}</button>` : '';
+      return `<div class="pr-info-row"><span>${e.data ? `<b>${plDate(e.data)}</b> · ` : ''}${esc(e.temat_maila)}</span>${ok}<button type="button" class="pr-icon" data-id="${esc(e.id)}" title="Ukryj">${ICON.x}</button></div>`;
+    }).join('') : '';
+    if (el.dataset.html === html) return;
+    el.dataset.html = html;
+    el.innerHTML = html;
+    el.hidden = !html;
     el.onclick = e => {
       const b = e.target.closest('button[data-id]');
       if (!b) return;
+      if (b.dataset.act === 'ok') {
+        const d = b.dataset.date;
+        setEntry(d, { status: 'przydzielone', ...(getLog()[d] ? {} : { proba: 1, szablon: 'z maila' }) });
+        status(`Oznaczono ${plDate(d)} jako przydzielone.`, 'ok');
+      }
       markDone(b.dataset.id);
       b.parentElement.remove();
-      if (!el.querySelector('.pr-info-row')) el.hidden = true;
+      if (!el.querySelector('.pr-info-row')) { el.hidden = true; el.dataset.html = ''; }
     };
   }
 
@@ -371,6 +485,10 @@
     #pr .pr-conn.ok i { background:var(--pr-ok); box-shadow:0 0 0 3px var(--pr-ok-bg); }
     #pr .pr-conn.warn i { background:var(--pr-wait); box-shadow:0 0 0 3px var(--pr-wait-bg); }
     #pr .pr-conn.off i { background:var(--pr-err); box-shadow:0 0 0 3px var(--pr-err-bg); }
+    #pr .pr-conn span { flex:1; }
+    #pr a { color:var(--pr-gold); }
+    #pr .pr-update { font-size:12px; padding:8px 10px; border-radius:8px; margin-bottom:10px; color:var(--pr-wait); background:var(--pr-wait-bg); }
+    #pr .pr-head-btns { display:flex; gap:2px; }
     #pr .pr-info { font-size:12px; padding:8px 10px; border:1px solid var(--pr-line); border-radius:8px; margin-bottom:10px; }
     #pr .pr-info-h { font-weight:600; margin-bottom:4px; }
     #pr .pr-info-row { display:flex; gap:8px; align-items:center; padding:3px 0; }
@@ -421,6 +539,7 @@
     #pr-banner .pr-b-note { margin-top:6px; display:inline-block; padding:3px 8px; border-radius:6px; background:rgba(255,255,255,.15); font-size:13px; }
     #pr-banner .pr-b-skip { border:1px solid rgba(255,255,255,.5); background:none; color:#fff; padding:7px 14px; border-radius:8px; font-weight:500; cursor:pointer; }
     #pr-banner .pr-b-skip:hover { background:rgba(255,255,255,.12); }
+    #pr-banner .pr-b-fill { border:0; background:#fff; color:#7f2620; padding:8px 16px; border-radius:8px; font-weight:600; cursor:pointer; }
     @media (prefers-color-scheme: dark) {
       #pr { --pr-bg:#1e1e1c; --pr-text:#ecebe7; --pr-muted:#a19f98; --pr-line:#34332f; --pr-soft:#282826;
         --pr-accent:#ecebe7; --pr-accent-text:#141413; --pr-gold:#cfae6c;
@@ -435,10 +554,14 @@
   panel.innerHTML = `
     <div class="pr-head">
       <div class="pr-title">Pomocnik rezerwacji<small id="pr-badge"></small></div>
-      <button type="button" class="pr-icon" id="pr-min" title="Zwiń / rozwiń">${ICON.min}</button>
+      <div class="pr-head-btns">
+        <a class="pr-icon" href="${HELPER}/" target="_blank" rel="noopener" title="Ustawienia programu (poczta, telefon, alarm)">${ICON.gear}</a>
+        <button type="button" class="pr-icon" id="pr-min" title="Zwiń / rozwiń">${ICON.min}</button>
+      </div>
     </div>
     <div class="pr-body">
       <div class="pr-conn off"><i></i><span>Sprawdzanie programu…</span></div>
+      <div class="pr-update" hidden></div>
       <div class="pr-info" hidden></div>
       <div class="pr-seg">
         <button type="button" data-tab="fill" class="on">Wypełnianie</button>
@@ -514,7 +637,7 @@
   const statusLabel = e => {
     if (!e) return '';
     const proba = e.proba > 1 ? `, próba ${e.proba}` : '';
-    return ` · ${STATUS[e.status].nazwa.toLowerCase()}${proba}`;
+    return ` · ${st(e.status).nazwa.toLowerCase()}${proba}`;
   };
 
   // Lista dat w panelu + dopiski statusu w oryginalnym polu „Data” na stronie.
@@ -541,7 +664,7 @@
   function renderLog() {
     const log = getLog();
     const dates = Object.keys(log).sort();
-    const count = s => dates.filter(d => log[d].status === s).length;
+    const count = s => dates.filter(d => (STATUS[log[d].status] ? log[d].status : 'wyslane') === s).length;
     q('#pr-sum').innerHTML = Object.entries(STATUS)
       .map(([k, s]) => `<div><b>${count(k)}</b><span>${s.nazwa}</span></div>`).join('');
     const waiting = count('wyslane');
@@ -552,7 +675,7 @@
       f === 'all' ? true : f === 'future' ? d >= today() : log[d].status === f);
 
     q('#pr-list').innerHTML = shown.length ? shown.map(d => {
-      const e = log[d], s = STATUS[e.status];
+      const e = log[d], s = st(e.status);
       const meta = [e.godzina, e.proba > 1 ? `próba ${e.proba}` : '', e.szablon].filter(Boolean).join(' · ');
       return `<div class="pr-item" data-date="${d}">
         <span class="d">${plDate(d)} <small>${weekday(d)}</small></span>
@@ -590,15 +713,16 @@
 
   q('#pr-csv').onclick = () => {
     const log = getLog();
-    const rows = [['Data', 'Dzień', 'Status', 'Próba', 'Godzina', 'Szablon', 'Wysłano']].concat(
-      Object.keys(log).sort().map(d => [plDate(d), weekday(d), STATUS[log[d].status].nazwa, log[d].proba || 1,
-        log[d].godzina || '', log[d].szablon || '', log[d].wyslano ? new Date(log[d].wyslano).toLocaleString('pl-PL') : '']));
+    const rows = [['Data', 'Dzień', 'Status', 'Próba', 'Godzina', 'Szablon', 'Wysłano', 'Odrzucono']].concat(
+      Object.keys(log).sort().map(d => [plDate(d), weekday(d), st(log[d].status).nazwa, log[d].proba || 1,
+        log[d].godzina || '', log[d].szablon || '', log[d].wyslano ? new Date(log[d].wyslano).toLocaleString('pl-PL') : '',
+        log[d].odrzucono ? new Date(log[d].odrzucono).toLocaleString('pl-PL') : '']));
     const csv = '﻿' + rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(';')).join('\r\n');
     download(csv, `zgloszenia-${today()}.csv`, 'text/csv');
   };
 
   q('#pr-backup').onclick = () => download(
-    JSON.stringify({ szablony: load(TPL_KEY, {}), zgloszenia: getLog() }, null, 2),
+    JSON.stringify({ szablony: load(TPL_KEY, {}), zgloszenia: getLog(), szablon_automat: load(TPL_AUTO_KEY, '') }, null, 2),
     `pomocnik-kopia-${today()}.json`, 'application/json');
 
   q('#pr-restore').onclick = () => q('#pr-file').click();
@@ -607,13 +731,18 @@
     if (!file) return;
     try {
       const data = JSON.parse(await file.text());
-      if (!confirm('Wczytać kopię? Wpisy z kopii zostaną dodane do obecnych (przy tych samych datach wygrywa kopia).')) return;
-      save(TPL_KEY, { ...load(TPL_KEY, {}), ...(data.szablony || {}) });
-      save(LOG_KEY, { ...getLog(), ...(data.zgloszenia || {}) });
-      renderTemplates(); refreshAll();
+      const obj = v => v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+      const szablony = Object.fromEntries(Object.entries(obj(data.szablony)).filter(([, t]) => t && typeof t.fields === 'object'));
+      const zgloszenia = Object.fromEntries(Object.entries(obj(data.zgloszenia))
+        .filter(([d, w]) => /^\d{4}-\d{2}-\d{2}$/.test(d) && w && typeof w === 'object')
+        .map(([d, w]) => [d, { ...w, status: STATUS[w.status] ? w.status : 'wyslane' }]));
+      if (!Object.keys(szablony).length && !Object.keys(zgloszenia).length) throw new Error('pusta kopia');
+      if (!confirm(`Wczytać kopię? Szablony: ${Object.keys(szablony).length}, zgłoszenia: ${Object.keys(zgloszenia).length}.\nZostaną dodane do obecnych (przy tych samych datach i nazwach wygrywa kopia).`)) return;
+      save(TPL_KEY, { ...load(TPL_KEY, {}), ...szablony });
+      save(LOG_KEY, { ...getLog(), ...zgloszenia });
+      renderTemplates(typeof data.szablon_automat === 'string' ? data.szablon_automat : undefined); refreshAll();
       alert('Wczytano.');
-    } catch { alert('To nie jest poprawny plik kopii.'); }
-    e.target.value = '';
+    } catch { alert('To nie jest poprawny plik kopii.'); } finally { e.target.value = ''; }
   };
 
   function download(text, name, type) {
@@ -632,7 +761,7 @@
     const e = getLog()[date];
     // Po odrzuceniu wolno wysłać ponownie – ostrzegamy tylko przy „czeka” i „przydzielone”.
     if (e && e.status !== 'odrzucone' &&
-        !confirm(`Na ${plDate(date)} już jest zgłoszenie (${STATUS[e.status].nazwa.toLowerCase()}).\nMożna wysłać tylko jedno zapytanie na dzień. Mimo to wypełnić?`)) return;
+        !confirm(`Na ${plDate(date)} już jest zgłoszenie (${st(e.status).nazwa.toLowerCase()}).\nMożna wysłać tylko jedno zapytanie na dzień. Mimo to wypełnić?`)) return;
     fillForm(tpl, date);
   };
 
@@ -659,12 +788,18 @@
   // Ostrzeżenie, gdy ktoś ręcznie wybierze w formularzu dzień, na który już wysłano zapytanie.
   $(form[P + 'data']).on('change', function () {
     const e = getLog()[this.value];
-    if (e && e.status !== 'odrzucone') status(`Na ${plDate(this.value)} już jest zgłoszenie (${STATUS[e.status].nazwa.toLowerCase()}).`, 'err');
+    if (e && e.status !== 'odrzucone') status(`Na ${plDate(this.value)} już jest zgłoszenie (${st(e.status).nazwa.toLowerCase()}).`, 'err');
   });
+
+  // Zmiany w innej karcie (np. wysłane zgłoszenie, nowy szablon) od razu widać w tej.
+  if (typeof GM_addValueChangeListener === 'function') {
+    GM_addValueChangeListener(LOG_KEY, (k, o, n, remote) => { if (remote) refreshAll(); });
+    GM_addValueChangeListener(TPL_KEY, (k, o, n, remote) => { if (remote) renderTemplates(selTpl.value); });
+  }
 
   renderTemplates();
   refreshAll();
   checkHelper();
-  setInterval(checkHelper, 30e3);
-  autoProcess();
+  pollEvents(true);
+  setInterval(() => { checkHelper(); pollEvents(false); }, 20e3);
 })();

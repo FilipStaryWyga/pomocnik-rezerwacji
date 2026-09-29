@@ -41,6 +41,35 @@ zd = p.rozpoznaj(m.as_bytes(), 'museum.auschwitz.org')
 sprawdz('rozpoznanie odrzucenia', zd and zd['typ'] == 'odrzucenie' and zd['data'] == '2026-12-08'
         and zd['godzina'] == '12:00' and zd['rodzaj'] == 'Zwiedzanie ogólne 3,5 godz.', zd)
 
+# Mail z nieznanym kodowaniem znaków nie może przerwać czuwania.
+zly = (b'From: visit@museum.auschwitz.org\r\nSubject: Odrzucenie zapytania o grupe - 2026-12-09 9:00 - polski\r\n'
+       b'Content-Type: text/plain; charset=x-nieznany\r\n\r\n2026-12-09 09:00\r\nZwiedzanie\r\n')
+try:
+    zd = p.rozpoznaj(zly, 'museum.auschwitz.org')
+    sprawdz('mail z nieznanym kodowaniem', zd and zd['typ'] == 'odrzucenie' and zd['godzina'] == '09:00', zd)
+except Exception as e:
+    sprawdz('mail z nieznanym kodowaniem', False, e)
+
+# Pusty filtr nadawcy nie może przepuszczać wszystkich maili.
+sprawdz('pusty nadawca nie łapie spamu', p.rozpoznaj(b'From: sklep@example.com\r\nSubject: Promocja\r\n\r\nx', '') is None)
+sprawdz('pusty nadawca w ustawieniach', p.uporzadkuj({**p.DOMYSLNE, 'nadawca': '  '})['nadawca'] == 'museum.auschwitz.org')
+sprawdz('błędne liczby w ustawieniach', p.uporzadkuj({**p.DOMYSLNE, 'imap_port': 'abc', 'co_ile_sekund': '1'})
+        == {**p.uporzadkuj(dict(p.DOMYSLNE)), 'co_ile_sekund': 3})
+
+# Inna wiadomość z muzeum z terminem w temacie
+m2 = EmailMessage()
+m2['From'] = 'visit@museum.auschwitz.org'
+m2['Subject'] = 'Potwierdzenie rezerwacji - 2026-12-10 10:00 - polski'
+m2.set_content('x')
+zd = p.rozpoznaj(m2.as_bytes(), 'museum.auschwitz.org')
+sprawdz('termin z innej wiadomości', zd and zd['typ'] == 'inny' and zd.get('data') == '2026-12-10', zd)
+
+# Foldery z polskimi znakami (IMAP: zmodyfikowane UTF-7)
+sprawdz('folder z polskimi znakami', p.folder_imap('Wysłane') == '"Wys&AUI-ane"', p.folder_imap('Wysłane'))
+sprawdz('folder – odczyt nazwy', p.folder_z_imap('Wys&AUI-ane') == 'Wysłane' and p.folder_z_imap('A&-B') == 'A&B')
+sprawdz('folder zwykły', p.folder_imap('INBOX') == '"INBOX"')
+sprawdz('wersja skryptu Chrome', p.WERSJA_SKRYPTU and p.WERSJA_SKRYPTU.count('.') >= 1, p.WERSJA_SKRYPTU)
+
 # Hasło w zabezpieczonym magazynie (Windows: DPAPI) – tylko na Windowsie, żeby nie ruszać Pęku kluczy
 if p.SYSTEM == 'Windows':
     trudne = 'zażółć gęślą jaźń "\'$&<>'
@@ -54,12 +83,51 @@ if p.SYSTEM == 'Windows':
     p.autostart_ustaw(False)
     sprawdz('autostart wyłączony', not p.autostart_wlaczony())
 
+# Czuwanie na atrapie skrzynki: uszkodzony mail nie może zablokować kolejnego odrzucenia.
+class AtrapaIMAP:
+    def __init__(self, maile):
+        self.maile = maile   # uid → surowy mail
+        self.untagged_responses = {'UIDVALIDITY': [b'7']}
+
+    def select(self, folder, readonly=False):
+        return ('OK', [b'1']) if folder == '"INBOX"' else ('NO', [b'brak'])
+
+    def list(self):
+        return 'OK', [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "Wys&AUI-ane"']
+
+    def uid(self, polecenie, *arg):
+        if polecenie == 'search':
+            od = int(arg[1].split()[1].split(':')[0])
+            return 'OK', [' '.join(str(u) for u in sorted(self.maile) if u >= od).encode()]
+        return 'OK', [(b'1 (BODY[] {1}', self.maile[int(arg[0])]), b')']
+
+
+zdarzenia_testu = []
+p.reaguj = lambda k, zd: zdarzenia_testu.append(zd)   # bez alarmów i otwierania Chrome w teście
+k_test = {**p.konfig(), 'login': 'atrapa@example.com'}
+atrapa = AtrapaIMAP({1: m.as_bytes()})
+p.sprawdz_folder(k_test, atrapa, 'INBOX')            # pierwsze uruchomienie – stare maile pomijamy
+atrapa.maile[2] = zly
+atrapa.maile[3] = m.as_bytes().replace(b'2026-12-08', b'2026-12-11')
+try:
+    p.sprawdz_folder(k_test, atrapa, 'INBOX')
+    p.sprawdz_folder(k_test, atrapa, 'INBOX')        # drugi raz – bez powtórnego alarmu
+    daty = [z['data'] for z in zdarzenia_testu]
+    sprawdz('czuwanie po uszkodzonym mailu', daty == ['2026-12-09', '2026-12-11'], daty)
+except Exception as e:
+    sprawdz('czuwanie po uszkodzonym mailu', False, e)
+try:
+    p.sprawdz_folder(k_test, atrapa, 'Wysłane')
+    sprawdz('brakujący folder', False)
+except Exception as e:
+    sprawdz('brakujący folder', 'Wysłane' in str(e) and 'INBOX' in str(e), e)
+
 sprawdz('dźwięki systemowe', len(p.dostepne_dzwieki()) > 0, p.dostepne_dzwieki())
 p.powiadom_system('Test', 'Test powiadomienia')
 p.zagraj_alarm(p.konfig(), 1)
 
 # Lokalny serwer
-serwer = p.ThreadingHTTPServer(('127.0.0.1', p.PORT), p.Obsluga)
+serwer = p.Serwer(('127.0.0.1', p.PORT), p.Obsluga)
 threading.Thread(target=serwer.serve_forever, daemon=True).start()
 time.sleep(0.5)
 baza = f'http://127.0.0.1:{p.PORT}'
@@ -72,8 +140,11 @@ def get(sciezka):
 
 def post(sciezka, dane):
     req = urllib.request.Request(baza + sciezka, data=json.dumps(dane).encode(), headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:   # odpowiedzi 4xx też mają treść w JSON
+        return json.load(e)
 
 
 kod, tresc = get('/')
@@ -88,6 +159,21 @@ try:
     sprawdz('blokada obcych stron', False)
 except urllib.error.HTTPError as e:
     sprawdz('blokada obcych stron', e.code == 403)
+
+# Druga kopia programu nie może zająć tego samego portu (inaczej alarmy przychodziłyby podwójnie).
+try:
+    p.Serwer(('127.0.0.1', p.PORT), p.Obsluga).server_close()
+    sprawdz('port na wyłączność', False)
+except OSError:
+    sprawdz('port na wyłączność', True)
+
+sprawdz('zła godzina próby', not post('/api/proba', {'data': '2026-12-08', 'godzina': '25:00'})['ok'])
+sprawdz('zła data próby', not post('/api/proba', {'data': '2026-13-45'})['ok'])
+sprawdz('sprawdzenie bez serwera IMAP', 'serwer' in post('/api/sprawdz', {'imap_serwer': '', 'login': 'a@b.pl'})['komunikat'])
+sprawdz('zapis błędnej liczby', post('/api/ustawienia', {'co_ile_sekund': 'abc'})['ok'] and p.konfig()['co_ile_sekund'] == 5)
+get('/status?v=9.9.9')
+stan = json.loads(get('/api/stan')[1])
+sprawdz('wersja skryptu z Chrome', stan['skrypt_chrome_wersja'] == '9.9.9' and stan['skrypt_wersja'] == p.WERSJA_SKRYPTU)
 
 serwer.shutdown()
 time.sleep(1)

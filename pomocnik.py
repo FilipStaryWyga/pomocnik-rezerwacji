@@ -38,7 +38,7 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-WERSJA = '4.0.1'
+WERSJA = '4.1.0'
 NAZWA = 'Pomocnik rezerwacji'
 PORT = int(os.environ.get('POMOCNIK_PORT', 47631))  # inny port tylko do testów
 SYSTEM = platform.system()  # 'Darwin' | 'Windows' | 'Linux'
@@ -129,8 +129,17 @@ DOMYSLNE = {
 def wczytaj_json(sciezka, domyslne):
     try:
         with open(sciezka, encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            dane = json.load(f)
+        return dane if isinstance(dane, type(domyslne)) else domyslne
+    except FileNotFoundError:
+        return domyslne
+    except (ValueError, OSError) as e:
+        # Uszkodzony plik (np. po zaniku prądu) – zachowaj go do wglądu zamiast po cichu nadpisywać.
+        try:
+            shutil.copy2(sciezka, sciezka + '.uszkodzony')
+        except OSError:
+            pass
+        log('Uszkodzony plik', os.path.basename(sciezka), '–', e)
         return domyslne
 
 
@@ -142,10 +151,34 @@ def zapisz_json(sciezka, dane):
 
 
 def konfig():
-    k = {**DOMYSLNE, **wczytaj_json(PLIK_KONFIG, {})}
+    k = uporzadkuj({**DOMYSLNE, **wczytaj_json(PLIK_KONFIG, {})})
     if not k['ntfy_temat']:
         k['ntfy_temat'] = 'pomocnik-' + secrets.token_hex(8)
         zapisz_json(PLIK_KONFIG, k)
+    return k
+
+
+def liczba(wartosc, domyslna, od, do):
+    """Liczba całkowita z pola formularza; puste lub błędne pole daje wartość domyślną."""
+    try:
+        return min(do, max(od, int(str(wartosc).strip() or domyslna)))
+    except (TypeError, ValueError):
+        return domyslna
+
+
+def uporzadkuj(k):
+    """Poprawia wartości z formularza (typy, zakresy, puste pola)."""
+    k['imap_serwer'] = str(k['imap_serwer'] or '').strip()
+    k['login'] = str(k['login'] or '').strip()
+    k['imap_port'] = liczba(k['imap_port'], 993, 1, 65535)
+    k['co_ile_sekund'] = liczba(k['co_ile_sekund'], 5, 3, 3600)
+    k['glosnosc'] = liczba(k['glosnosc'], 80, 0, 100)
+    k['powtorzenia'] = liczba(k['powtorzenia'], 3, 1, 20)
+    if isinstance(k['foldery'], str):
+        k['foldery'] = [f.strip() for f in k['foldery'].split(',') if f.strip()]
+    k['foldery'] = k['foldery'] or ['INBOX']
+    # Pusty nadawca pasowałby do każdego maila – wtedy alarmy wywoływałby spam i newslettery.
+    k['nadawca'] = str(k['nadawca'] or '').strip() or DOMYSLNE['nadawca']
     return k
 
 
@@ -155,12 +188,7 @@ def zapisz_konfig(zmiany):
         for klucz, wartosc in zmiany.items():
             if klucz in DOMYSLNE:
                 k[klucz] = wartosc
-        k['imap_port'] = int(k['imap_port'] or 993)
-        k['co_ile_sekund'] = max(3, int(k['co_ile_sekund'] or 5))
-        k['glosnosc'] = min(100, max(0, int(k['glosnosc'])))
-        k['powtorzenia'] = min(20, max(1, int(k['powtorzenia'])))
-        if isinstance(k['foldery'], str):
-            k['foldery'] = [f.strip() for f in k['foldery'].split(',') if f.strip()] or ['INBOX']
+        uporzadkuj(k)
         zapisz_json(PLIK_KONFIG, k)
         return k
 
@@ -209,6 +237,7 @@ def _hasla_plik_zapisz(hasla):
 
 
 def haslo_zapisz(login, haslo):
+    _czy_haslo.clear()
     if SYSTEM == 'Darwin':
         r = subprocess.run(['security', 'add-generic-password', '-U', '-s', SERWIS_HASLA, '-a', login, '-w', haslo],
                            capture_output=True, text=True)
@@ -228,6 +257,20 @@ def haslo_odczytaj(login):
                            capture_output=True, text=True)
         return r.stdout.rstrip('\n') if r.returncode == 0 else None
     return _hasla_plik().get(login)
+
+
+_czy_haslo = {}   # login → (czy jest hasło, kiedy sprawdzono)
+
+
+def ma_haslo(login):
+    """Czy jest zapisane hasło – z krótką pamięcią, bo strona ustawień pyta co 3 sekundy
+    (na Macu każde sprawdzenie to osobny proces „security”)."""
+    zapamietane = _czy_haslo.get(login)
+    if zapamietane and time.time() - zapamietane[1] < 30:
+        return zapamietane[0]
+    wynik = bool(haslo_odczytaj(login))
+    _czy_haslo[login] = (wynik, time.time())
+    return wynik
 
 
 # ---------- Autostart ----------
@@ -417,10 +460,20 @@ def zagraj_alarm(k, powtorzenia=None):
 # ---------- Rozpoznawanie maili ----------
 
 def tekst_maila(msg):
-    czesc = msg.get_body(preferencelist=('plain', 'html'))
+    try:
+        czesc = msg.get_body(preferencelist=('plain', 'html'))
+    except Exception:
+        return ''
     if czesc is None:
         return ''
-    tresc = czesc.get_content()
+    try:
+        tresc = czesc.get_content()
+    except Exception:
+        # Nieznane lub błędne kodowanie znaków – odczytaj, co się da, zamiast przerywać czuwanie.
+        surowe = czesc.get_payload(decode=True) or b''
+        tresc = surowe.decode('utf-8', 'replace') if isinstance(surowe, bytes) else str(surowe)
+    if not isinstance(tresc, str):
+        return ''
     if czesc.get_content_type() == 'text/html':
         tresc = re.sub(r'(?i)<br\s*/?>|</p>|</div>', '\n', tresc)
         tresc = html.unescape(re.sub(r'<[^>]+>', '', tresc))
@@ -430,16 +483,28 @@ def tekst_maila(msg):
 def rozpoznaj(surowy, nadawca_filtr, przekazane=False):
     """Zwraca słownik zdarzenia albo None, jeśli to nie jest mail z muzeum."""
     msg = email.message_from_bytes(surowy, policy=email.policy.default)
-    nadawca = str(msg.get('From', ''))
-    if nadawca_filtr.lower() not in nadawca.lower():
-        if not (przekazane and nadawca_filtr.lower() in tekst_maila(msg).lower()):
+    nadawca_filtr = (nadawca_filtr or DOMYSLNE['nadawca']).lower()
+
+    def naglowek(nazwa):
+        try:
+            return str(msg.get(nazwa, ''))
+        except Exception:   # błędnie zakodowany nagłówek
+            return ''
+
+    nadawca = naglowek('From')
+    if nadawca_filtr not in nadawca.lower():
+        if not (przekazane and nadawca_filtr in tekst_maila(msg).lower()):
             return None
-    temat = ' '.join(str(msg.get('Subject', '')).split())
-    zd = {'temat_maila': temat, 'nadawca': nadawca, 'message_id': str(msg.get('Message-ID', ''))}
+    temat = ' '.join(naglowek('Subject').split())
+    zd = {'temat_maila': temat, 'nadawca': nadawca, 'message_id': naglowek('Message-ID')}
 
     m = TEMAT_ODRZUCENIA.search(temat)
     if not m:
         zd['typ'] = 'inny'
+        # Termin z tematu (np. potwierdzenie rezerwacji) – skrypt w Chrome pozwoli oznaczyć go w dzienniku.
+        d = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', temat)
+        if d:
+            zd['data'] = d.group(1)
         return zd
 
     data, godzina, jezyk = m.group(1), m.group(2).zfill(5), m.group(3).strip()
@@ -460,7 +525,8 @@ def wyslij_na_telefon(k, tytul, tresc, pilne):
         return True
     try:
         body = json.dumps({'topic': k['ntfy_temat'], 'title': tytul, 'message': tresc,
-                           'priority': 5 if pilne else 3}).encode()
+                           'priority': 5 if pilne else 3,
+                           'tags': ['rotating_light'] if pilne else ['envelope']}).encode()
         req = urllib.request.Request(k['ntfy_serwer'], data=body, headers={'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=10).read()
         return True
@@ -521,7 +587,7 @@ def otworz_w_chrome(url):
 def reaguj(k, zd):
     if zd['typ'] == 'odrzucenie':
         d = datetime.strptime(zd['data'], '%Y-%m-%d').strftime('%d.%m.%Y')
-        tytul = f'Odrzucono {d}, {zd["godzina"]}'
+        tytul = ('PRÓBA: ' if str(zd.get('id', '')).startswith('proba') else '') + f'Odrzucono {d}, {zd["godzina"]}'
         tresc = (f'{zd["jezyk"].capitalize()} · {zd["rodzaj"] or "zwiedzanie grupowe"}. '
                  'Formularz jest gotowy na komputerze – zaznacz CAPTCHA i wyślij.')
         wyslij_na_telefon(k, tytul, tresc, True)
@@ -545,64 +611,160 @@ def nowe_zdarzenie(k, zd):
         stan['zdarzenia'] = zdarzenia[-100:]
         zapisz_json(PLIK_STAN, stan)
     log('Nowy mail:', zd['typ'], zd.get('data', ''), zd.get('godzina', ''), zd.get('jezyk', ''), '|', zd['temat_maila'])
-    reaguj(k, zd)
+    try:
+        reaguj(k, zd)
+    except Exception as e:
+        log('Błąd podczas alarmu:', e)
 
 
 # ---------- Czuwanie nad pocztą ----------
 
 def przyjazny_blad(e):
     t = str(e)
-    if 'AUTHENTICATIONFAILED' in t or 'Invalid credentials' in t or 'authentication failed' in t.lower():
-        return 'Nieprawidłowy login lub hasło.'
-    if 'Application-specific password' in t or 'app password' in t.lower():
-        return 'Gmail wymaga hasła do aplikacji (myaccount.google.com/apppasswords).'
-    if isinstance(e, TimeoutError) or 'timed out' in t:
+    tl = t.lower()
+    if 'application-specific password' in tl or 'app password' in tl:
+        return 'Gmail wymaga hasła do aplikacji (myaccount.google.com/apppasswords), a nie zwykłego hasła do konta.'
+    if 'AUTHENTICATIONFAILED' in t or 'invalid credentials' in tl or 'authentication failed' in tl \
+            or 'login failed' in tl or 'authenticate failed' in tl:
+        return ('Nieprawidłowy login lub hasło. W Gmailu użyj hasła do aplikacji; '
+                'w Outlook/Microsoft 365 logowanie hasłem przez IMAP bywa wyłączone przez administratora.')
+    if 'certificate_verify_failed' in tl or 'certificate verify failed' in tl:
+        return ('Nie można sprawdzić certyfikatu serwera poczty. Sprawdź datę i godzinę w komputerze '
+                'albo program antywirusowy skanujący pocztę.')
+    if 'wrong_version_number' in tl or 'wrong version number' in tl or 'unknown protocol' in tl:
+        return 'Serwer nie obsługuje szyfrowanego połączenia na tym porcie. Zwykle właściwy port to 993.'
+    if isinstance(e, ConnectionRefusedError) or 'connection refused' in tl:
+        return 'Serwer poczty odrzucił połączenie. Sprawdź adres serwera IMAP i port (zwykle 993).'
+    if isinstance(e, TimeoutError) or 'timed out' in tl:
         return 'Serwer poczty nie odpowiada. Sprawdź adres serwera i połączenie z internetem.'
-    if 'nodename nor servname' in t or 'getaddrinfo' in t or 'Name or service not known' in t:
+    if 'nodename nor servname' in t or 'getaddrinfo' in t or 'Name or service not known' in t \
+            or 'No address associated' in t or 'Errno 11001' in t:
         return 'Nie znaleziono serwera poczty. Sprawdź adres serwera IMAP i połączenie z internetem.'
     return t
 
 
 def polacz(k, haslo=None):
+    if not k['imap_serwer']:
+        raise imaplib.IMAP4.error('Podaj adres serwera IMAP (np. imap.gmail.com).')
+    if not k['login']:
+        raise imaplib.IMAP4.error('Podaj adres e-mail skrzynki.')
     haslo = haslo if haslo is not None else haslo_odczytaj(k['login'])
     if not haslo:
         raise imaplib.IMAP4.error('Brak zapisanego hasła do skrzynki.')
     m = imaplib.IMAP4_SSL(k['imap_serwer'], int(k['imap_port']), timeout=30)
-    m.login(k['login'], haslo)
+    try:
+        m.login(k['login'], haslo)
+    except Exception:
+        try:
+            m.shutdown()
+        except Exception:
+            pass
+        raise
     return m
 
 
-def sprawdz_folder(k, m, folder):
-    typ, _ = m.select(f'"{folder}"', readonly=True)
+def policz_maile_z_muzeum(k, m):
+    """Liczba maili od muzeum w obserwowanych folderach (do sprawdzenia ustawień)."""
+    kryterium = 'TEXT' if k['akceptuj_przekazane'] else 'FROM'
+    nadawca = '"' + k['nadawca'].replace('\\', '\\\\').replace('"', '\\"') + '"'
+    liczby = {}
+    for folder in k['foldery']:
+        otworz_folder(m, folder)
+        _, d = m.uid('search', None, kryterium, nadawca)
+        liczby[folder] = (d[0] or b'').split()
+    return liczby
+
+
+def folder_imap(nazwa):
+    """Nazwa folderu w postaci wymaganej przez IMAP (zmodyfikowane UTF-7, w cudzysłowie),
+    żeby działały też foldery z polskimi znakami, np. „Zgłoszenia”."""
+    wynik, bufor = [], []
+
+    def zrzuc():
+        if bufor:
+            b64 = base64.b64encode(''.join(bufor).encode('utf-16-be')).decode().rstrip('=')
+            wynik.append('&' + b64.replace('/', ',') + '-')
+            bufor.clear()
+
+    for znak in nazwa:
+        if 0x20 <= ord(znak) <= 0x7e:
+            zrzuc()
+            wynik.append('&-' if znak == '&' else znak)
+        else:
+            bufor.append(znak)
+    zrzuc()
+    return '"' + ''.join(wynik).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def folder_z_imap(nazwa):
+    """Odwrotność folder_imap (bez cudzysłowów) – do pokazania listy folderów."""
+    def zamien(m):
+        if m.group(1) == '':
+            return '&'
+        b64 = m.group(1).replace(',', '/')
+        return base64.b64decode(b64 + '=' * (-len(b64) % 4)).decode('utf-16-be', 'replace')
+    return re.sub(r'&([^-]*)-', zamien, nazwa)
+
+
+def lista_folderow(m):
+    typ, dane = m.list()
     if typ != 'OK':
-        raise imaplib.IMAP4.error(f'Nie można otworzyć folderu {folder}.')
+        return []
+    foldery = []
+    for linia in dane or []:
+        if not isinstance(linia, bytes):
+            continue
+        r = re.match(rb'\((.*?)\) (?:"(?:\\.|[^"])*"|NIL) (.+)$', linia)
+        if not r or b'\\Noselect' in r.group(1):
+            continue
+        nazwa = r.group(2).decode('ascii', 'replace').strip()
+        if nazwa.startswith('"') and nazwa.endswith('"'):
+            nazwa = nazwa[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+        foldery.append(folder_z_imap(nazwa))
+    return foldery
+
+
+def otworz_folder(m, folder):
+    typ, _ = m.select(folder_imap(folder), readonly=True)
+    if typ != 'OK':
+        dostepne = lista_folderow(m)
+        podpowiedz = f' Dostępne foldery: {", ".join(dostepne[:15])}.' if dostepne else ''
+        raise imaplib.IMAP4.error(f'W skrzynce nie ma folderu „{folder}”.{podpowiedz}')
+
+
+def sprawdz_folder(k, m, folder):
+    otworz_folder(m, folder)
     uidvalidity = m.untagged_responses.get('UIDVALIDITY', [b'0'])[-1].decode()
     klucz = f'{k["login"]}|{folder}|{uidvalidity}'
 
     with blokada:
         ostatni = wczytaj_json(PLIK_STAN, {}).get('ostatni_uid', {}).get(klucz)
 
+    def zapamietaj(uid):
+        with blokada:
+            stan = wczytaj_json(PLIK_STAN, {})
+            stan.setdefault('ostatni_uid', {})[klucz] = uid
+            zapisz_json(PLIK_STAN, stan)
+
     _, dane = m.uid('search', None, f'UID {(ostatni or 0) + 1}:*')
     uidy = [int(u) for u in (dane[0] or b'').split()]
     if ostatni is None:
-        nowy = max(uidy, default=0)   # pierwsze uruchomienie: stare maile pomijamy, czuwamy od teraz
-    else:
-        nowy = ostatni
-        for uid in sorted(u for u in uidy if u > ostatni):
-            _, d = m.uid('fetch', str(uid), '(BODY.PEEK[])')  # PEEK = nie oznacza jako przeczytane
-            surowy = next((c[1] for c in d if isinstance(c, tuple)), None)
-            if surowy:
+        zapamietaj(max(uidy, default=0))   # pierwsze uruchomienie: stare maile pomijamy, czuwamy od teraz
+        return
+    for uid in sorted(u for u in uidy if u > ostatni):
+        _, d = m.uid('fetch', str(uid), '(BODY.PEEK[])')  # PEEK = nie oznacza jako przeczytane
+        surowy = next((c[1] for c in d if isinstance(c, tuple)), None)
+        if surowy:
+            try:
                 zd = rozpoznaj(surowy, k['nadawca'], k['akceptuj_przekazane'])
-                if zd:
-                    zd['id'] = f'{uidvalidity}-{uid}'
-                    nowe_zdarzenie(k, zd)
-            nowy = uid
-
-    if nowy != ostatni:
-        with blokada:
-            stan = wczytaj_json(PLIK_STAN, {})
-            stan.setdefault('ostatni_uid', {})[klucz] = nowy
-            zapisz_json(PLIK_STAN, stan)
+            except Exception as e:
+                # Jeden nietypowy mail nie może zatrzymać czuwania – pomijamy go i idziemy dalej.
+                log(f'Nie udało się odczytać maila {uid} w folderze {folder}:', e)
+                zd = None
+            if zd:
+                zd['id'] = f'{uidvalidity}-{uid}'
+                nowe_zdarzenie(k, zd)
+        zapamietaj(uid)   # po każdym mailu, żeby po przerwaniu połączenia nie alarmować drugi raz
 
 
 class Czuwanie(threading.Thread):
@@ -669,7 +831,21 @@ class Czuwanie(threading.Thread):
 
 
 czuwanie = Czuwanie()
-skrypt_chrome = {'ostatnio': None}   # kiedy skrypt w Chrome ostatnio odezwał się do programu
+# Kiedy skrypt w Chrome ostatnio odezwał się do programu i w jakiej wersji.
+skrypt_chrome = {'ostatnio': None, 'wersja': None}
+
+
+def wersja_skryptu():
+    """Wersja skryptu dołączonego do programu (z nagłówka @version)."""
+    try:
+        with open(PLIK_SKRYPTU, encoding='utf-8') as f:
+            m = re.search(r'@version\s+(\S+)', f.read(2000))
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+WERSJA_SKRYPTU = wersja_skryptu()
 
 
 # ---------- Lokalny serwer: strona ustawień + API dla skryptu w Chrome ----------
@@ -682,12 +858,22 @@ def stan_publiczny():
         'wersja': WERSJA, 'system': SYSTEM,
         **czuwanie.stan,
         'ustawienia': {kl: k[kl] for kl in DOMYSLNE},
-        'ma_haslo': bool(haslo_odczytaj(k['login'])),
+        'ma_haslo': ma_haslo(k['login']),
         'autostart': autostart_wlaczony(),
         'dzwieki': list(dostepne_dzwieki()),
         'skrypt_chrome': skrypt_chrome['ostatnio'],
+        'skrypt_chrome_wersja': skrypt_chrome['wersja'],
+        'skrypt_wersja': WERSJA_SKRYPTU,
+        'chrome': bool(znajdz_chrome()),
         'zdarzenia': list(reversed(zdarzenia[-30:])),
     }
+
+
+def kontakt_skryptu(zapytanie):
+    """Zapamiętuje, że skrypt w Chrome działa (i w jakiej wersji – starsze wersje jej nie podają)."""
+    skrypt_chrome['ostatnio'] = datetime.now().astimezone().isoformat(timespec='seconds')
+    m = re.search(r'(?:^|&)v=([\w.\-]+)', zapytanie)
+    skrypt_chrome['wersja'] = m.group(1) if m else 'starsza'
 
 
 class Obsluga(BaseHTTPRequestHandler):
@@ -711,7 +897,7 @@ class Obsluga(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._json(403, {'blad': 'zabronione'})
-        sciezka = self.path.split('?')[0]
+        sciezka, _, zapytanie = self.path.partition('?')
         if sciezka == '/':
             self._wyslij(200, STRONA.encode(), 'text/html; charset=utf-8')
         elif sciezka == '/api/stan':
@@ -719,12 +905,13 @@ class Obsluga(BaseHTTPRequestHandler):
         elif sciezka == '/api/log':
             self._json(200, {'linie': ostatnie_linie_logu()})
         elif sciezka == '/status':   # dla skryptu w Chrome
-            skrypt_chrome['ostatnio'] = datetime.now().astimezone().isoformat(timespec='seconds')
-            self._json(200, {'ok': True, **czuwanie.stan})
+            kontakt_skryptu(zapytanie)
+            self._json(200, {'ok': True, **czuwanie.stan, 'wersja': WERSJA, 'skrypt_wersja': WERSJA_SKRYPTU})
         elif sciezka == '/zdarzenia':
-            skrypt_chrome['ostatnio'] = datetime.now().astimezone().isoformat(timespec='seconds')
+            kontakt_skryptu(zapytanie)
             with blokada:
-                self._json(200, {'zdarzenia': wczytaj_json(PLIK_STAN, {}).get('zdarzenia', [])[-50:]})
+                zdarzenia = wczytaj_json(PLIK_STAN, {}).get('zdarzenia', [])[-50:]
+            self._json(200, {'zdarzenia': zdarzenia})
         elif sciezka == '/pomocnik.user.js':
             try:
                 with open(PLIK_SKRYPTU, 'rb') as f:
@@ -743,10 +930,12 @@ class Obsluga(BaseHTTPRequestHandler):
             return self._json(403, {'blad': 'zabronione'})
         if not self.headers.get('Content-Type', '').startswith('application/json'):
             return self._json(415, {'blad': 'wymagany JSON'})
-        dl = int(self.headers.get('Content-Length', 0))
         try:
+            dl = min(int(self.headers.get('Content-Length') or 0), 1_000_000)
             dane = json.loads(self.rfile.read(dl) or b'{}')
-        except json.JSONDecodeError:
+        except ValueError:
+            return self._json(400, {'blad': 'zły JSON'})
+        if not isinstance(dane, dict):
             return self._json(400, {'blad': 'zły JSON'})
         sciezka = self.path.split('?')[0]
 
@@ -764,23 +953,30 @@ class Obsluga(BaseHTTPRequestHandler):
                 return self._json(200, {'ok': True})
 
             if sciezka == '/api/sprawdz':
-                k = {**konfig(), **{kl: w for kl, w in dane.items() if kl in DOMYSLNE}}
-                if isinstance(k['foldery'], str):
-                    k['foldery'] = [f.strip() for f in k['foldery'].split(',') if f.strip()] or ['INBOX']
+                k = uporzadkuj({**konfig(), **{kl: w for kl, w in dane.items() if kl in DOMYSLNE}})
                 try:
                     m = polacz(k, dane.get('haslo') or None)
                 except Exception as e:
                     return self._json(200, {'ok': False, 'komunikat': przyjazny_blad(e)})
                 try:
-                    liczba = 0
-                    for folder in k['foldery']:
-                        m.select(f'"{folder}"', readonly=True)
-                        kryterium = f'TEXT "{k["nadawca"]}"' if k['akceptuj_przekazane'] else f'FROM "{k["nadawca"]}"'
-                        _, d = m.uid('search', None, kryterium)
-                        liczba += len((d[0] or b'').split())
+                    liczba = sum(len(u) for u in policz_maile_z_muzeum(k, m).values())
+                except Exception as e:
+                    return self._json(200, {'ok': False, 'komunikat': 'Zalogowano, ale: ' + przyjazny_blad(e)})
                 finally:
-                    m.logout()
-                return self._json(200, {'ok': True, 'komunikat': f'Połączono. Wiadomości z muzeum w skrzynce: {liczba}.'})
+                    try:
+                        m.logout()
+                    except Exception:
+                        pass
+                return self._json(200, {'ok': True, 'komunikat': f'Połączono. Wiadomości z muzeum w skrzynce: {liczba}.'
+                                        + ('' if liczba else ' To normalne, jeśli muzeum jeszcze nic nie przysłało na ten adres.')})
+
+            if sciezka == '/api/otworz':
+                # Formularz w Chrome; z identyfikatorem odrzucenia skrypt wypełni go tym terminem.
+                id_zd = str(dane.get('id') or '')
+                if id_zd and not re.fullmatch(r'[\w-]{1,64}', id_zd):
+                    return self._json(400, {'ok': False, 'komunikat': 'Zły identyfikator.'})
+                otworz_w_chrome(ADRES_FORMULARZA + (f'#pomocnik={id_zd}' if id_zd else ''))
+                return self._json(200, {'ok': True})
 
             if sciezka == '/api/telefon-test':
                 ok = wyslij_na_telefon({**konfig(), 'telefon': True}, 'Pomocnik rezerwacji – próba',
@@ -792,11 +988,17 @@ class Obsluga(BaseHTTPRequestHandler):
                 return self._json(200, {'ok': True})
 
             if sciezka in ('/api/proba', '/test'):
+                godzina = str(dane.get('godzina') or '12:00').strip().replace('.', ':')
                 zd = {'typ': 'odrzucenie', 'id': 'proba-' + secrets.token_hex(4), 'message_id': '',
-                      'data': dane.get('data'), 'godzina': dane.get('godzina', '12:00'),
-                      'jezyk': dane.get('jezyk', 'polski'), 'rodzaj': dane.get('rodzaj', 'Zwiedzanie ogólne 3,5 godz.')}
-                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', zd['data'] or ''):
+                      'data': str(dane.get('data') or ''), 'godzina': godzina.zfill(5),
+                      'jezyk': str(dane.get('jezyk') or 'polski').strip(),
+                      'rodzaj': str(dane.get('rodzaj') or 'Zwiedzanie ogólne 3,5 godz.').strip()}
+                try:
+                    datetime.strptime(zd['data'], '%Y-%m-%d')
+                except ValueError:
                     return self._json(400, {'ok': False, 'komunikat': 'Podaj datę.'})
+                if not re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', zd['godzina']):
+                    return self._json(400, {'ok': False, 'komunikat': 'Podaj godzinę w formacie GG:MM, np. 12:00.'})
                 zd['temat_maila'] = f'[PRÓBA] Odrzucenie zapytania o grupę - {zd["data"]} {zd["godzina"]} - {zd["jezyk"]}'
                 threading.Thread(target=nowe_zdarzenie, args=(konfig(), zd), daemon=True).start()
                 return self._json(200, {'ok': True, 'id': zd['id']})
@@ -824,6 +1026,18 @@ class Obsluga(BaseHTTPRequestHandler):
 
 
 # ---------- Uruchomienie ----------
+
+class Serwer(ThreadingHTTPServer):
+    # Na Windowsie SO_REUSEADDR pozwala drugiej kopii programu zająć ten sam port – wtedy dwie kopie
+    # czuwałyby naraz i każdy alarm przychodziłby podwójnie. Tam port musi być na wyłączność.
+    allow_reuse_address = SYSTEM != 'Windows'
+
+    def server_bind(self):
+        if SYSTEM == 'Windows':
+            import socket
+            self.socket.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_EXCLUSIVEADDRUSE', -5), 1)
+        super().server_bind()
+
 
 def juz_dziala():
     try:
@@ -853,8 +1067,15 @@ def uruchom(w_tle):
         webbrowser.open(adres)
         return
     try:
-        serwer = ThreadingHTTPServer(('127.0.0.1', PORT), Obsluga)
+        serwer = Serwer(('127.0.0.1', PORT), Obsluga)
     except OSError:
+        # Druga kopia uruchomiona w tej samej chwili (np. autostart i kliknięcie ikony) – to nie błąd.
+        for _ in range(20):
+            if juz_dziala():
+                if not w_tle:
+                    webbrowser.open(adres)
+                return
+            time.sleep(0.25)
         log(f'Port {PORT} jest zajęty przez inny program – nie można uruchomić.')
         powiadom_system(NAZWA, f'Nie można uruchomić: port {PORT} jest zajęty przez inny program.')
         return
@@ -873,17 +1094,29 @@ def uruchom(w_tle):
 
 def tryb_sprawdz():
     k = konfig()
-    m = polacz(k)
+    try:
+        m = polacz(k)
+    except Exception as e:
+        sys.exit('Nie udało się zalogować: ' + przyjazny_blad(e))
     print('Logowanie OK:', k['login'])
+    kryterium = 'TEXT' if k['akceptuj_przekazane'] else 'FROM'
     for folder in k['foldery']:
-        m.select(f'"{folder}"', readonly=True)
-        kryterium = f'TEXT "{k["nadawca"]}"' if k['akceptuj_przekazane'] else f'FROM "{k["nadawca"]}"'
-        _, dane = m.uid('search', None, kryterium)
+        try:
+            otworz_folder(m, folder)
+        except Exception as e:
+            print(f'\nFolder {folder}: {e}')
+            continue
+        _, dane = m.uid('search', None, kryterium, '"' + k['nadawca'] + '"')
         uidy = (dane[0] or b'').split()
         print(f'\nFolder {folder}: wiadomości z muzeum: {len(uidy)}. Ostatnie:')
         for uid in uidy[-10:]:
             _, d = m.uid('fetch', uid, '(BODY.PEEK[])')
-            zd = rozpoznaj(next(c[1] for c in d if isinstance(c, tuple)), k['nadawca'], k['akceptuj_przekazane'])
+            surowy = next((c[1] for c in d if isinstance(c, tuple)), None)
+            try:
+                zd = surowy and rozpoznaj(surowy, k['nadawca'], k['akceptuj_przekazane'])
+            except Exception as e:
+                print(f'  błąd odczytu maila {uid.decode()}: {e}')
+                continue
             if zd and zd['typ'] == 'odrzucenie':
                 print(f'  ODRZUCENIE  {zd["data"]} {zd["godzina"]} | {zd["jezyk"]} | {zd["rodzaj"] or "?"}')
             elif zd:
@@ -1002,7 +1235,12 @@ STRONA = r'''<!DOCTYPE html>
   .table-wrap{overflow-x:auto}
   .checks{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:4px}
   @media (max-width:520px){.checks{grid-template-columns:1fr}}
-  .check{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px}
+  .check{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;color:inherit;text-decoration:none}
+  a.check:hover{border-color:var(--muted)}
+  .check span{color:var(--muted)}
+  a{color:var(--gold)}
+  .card{scroll-margin-top:16px}
+  td .link{border:0;background:none;padding:0;color:var(--gold);font-size:13px;text-decoration:underline;cursor:pointer;white-space:nowrap}
   .check b{display:block;font-size:14px;font-weight:500}
   .check .dot{margin-top:6px}
   pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;max-height:260px;overflow:auto;white-space:pre-wrap;margin:0}
@@ -1012,26 +1250,29 @@ STRONA = r'''<!DOCTYPE html>
 <div class="wrap">
   <header>
     <h1>Pomocnik rezerwacji <small id="wersja"></small></h1>
-    <span class="pill" id="stan"><span class="dot"></span><span id="stan-txt">Łączenie…</span></span>
+    <div class="row" style="margin:0">
+      <button id="otworz-formularz" title="Otwiera formularz rezerwacji w Chrome">Otwórz formularz rezerwacji</button>
+      <span class="pill" id="stan"><span class="dot"></span><span id="stan-txt">Łączenie…</span></span>
+    </div>
   </header>
 
   <section class="card">
     <h2>Stan</h2>
     <p class="lead" id="stan-opis">Program sprawdza skrzynkę co kilka sekund.</p>
     <div class="checks">
-      <div class="check" id="c-poczta"><span class="dot"></span><div><b>Poczta</b><span></span></div></div>
-      <div class="check" id="c-chrome"><span class="dot"></span><div><b>Skrypt w Chrome</b><span></span></div></div>
-      <div class="check" id="c-telefon"><span class="dot"></span><div><b>Telefon</b><span></span></div></div>
-      <div class="check" id="c-autostart"><span class="dot"></span><div><b>Autostart</b><span></span></div></div>
+      <a class="check" id="c-poczta" href="#sekcja-poczta"><span class="dot"></span><div><b>Poczta</b><span></span></div></a>
+      <a class="check" id="c-chrome" href="#sekcja-chrome"><span class="dot"></span><div><b>Skrypt w Chrome</b><span></span></div></a>
+      <a class="check" id="c-telefon" href="#sekcja-telefon"><span class="dot"></span><div><b>Telefon</b><span></span></div></a>
+      <a class="check" id="c-autostart" href="#sekcja-program"><span class="dot"></span><div><b>Autostart</b><span></span></div></a>
     </div>
     <h3>Ostatnie wiadomości z muzeum</h3>
     <div class="table-wrap"><table>
-      <thead><tr><th>Odebrano</th><th>Rodzaj</th><th>Termin</th><th>Szczegóły</th></tr></thead>
+      <thead><tr><th>Odebrano</th><th>Rodzaj</th><th>Termin</th><th>Szczegóły</th><th></th></tr></thead>
       <tbody id="zdarzenia"></tbody>
     </table></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="sekcja-poczta">
     <h2><span class="num">1</span>Skrzynka pocztowa</h2>
     <p class="lead">Skrzynka, na którą muzeum wysyła odpowiedzi na zapytania.</p>
     <form id="f-poczta" class="grid" autocomplete="off" onsubmit="return false">
@@ -1057,7 +1298,7 @@ STRONA = r'''<!DOCTYPE html>
     <div class="row"><div class="msg" id="msg-poczta"></div></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="sekcja-telefon">
     <h2><span class="num">2</span>Powiadomienia na telefon</h2>
     <p class="lead">Alarm na telefonie w chwili, gdy muzeum odrzuci zapytanie. Korzysta z darmowej aplikacji ntfy.</p>
     <div class="phone">
@@ -1115,7 +1356,7 @@ STRONA = r'''<!DOCTYPE html>
     <div class="row"><button id="dzwiek-test">Odtwórz</button><span class="hint">Głośność zależy też od głośności systemu.</span></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="sekcja-chrome">
     <h2><span class="num">4</span>Przeglądarka Chrome</h2>
     <p class="lead">Skrypt w Chrome wypełnia formularz rezerwacji i prowadzi dziennik zgłoszeń.</p>
     <ol class="steps">
@@ -1129,7 +1370,7 @@ STRONA = r'''<!DOCTYPE html>
       <label class="tgl"><input type="checkbox" id="otwieraj_formularz" data-auto><i></i></label></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="sekcja-program">
     <h2><span class="num">5</span>Próba i ustawienia programu</h2>
     <p class="lead">Próbny alarm działa tak jak prawdziwe odrzucenie. W formularzu kliknij wtedy „Pomiń”, a nie „Wyślij”.</p>
     <div class="grid">
@@ -1160,9 +1401,16 @@ const POLA = ['login','imap_serwer','imap_port','foldery','nadawca','co_ile_seku
 let wczytano = false, qrTemat = '';
 
 async function api(sciezka, dane) {
-  const r = await fetch(sciezka, dane === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(dane)});
-  return r.json();
+  try {
+    const r = await fetch(sciezka, dane === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(dane)});
+    return await r.json();
+  } catch (e) {
+    if (dane === undefined) throw e;   // odświeżanie stanu samo pokazuje, że program nie działa
+    return {ok:false, komunikat:'Program nie odpowiada – uruchom Pomocnika rezerwacji ponownie.'};
+  }
 }
+const dzisISO = (dni = 0) => { const d = new Date(); d.setDate(d.getDate() + dni);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
 function msg(id, tekst, typ){ const el = $(id); el.textContent = tekst; el.className = 'msg ' + (typ || 'info'); }
 const plData = iso => iso ? iso.split('-').reverse().join('.') : '';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1202,7 +1450,11 @@ async function odswiez(){
   $('wersja').textContent = 'wersja ' + s.wersja;
   window.OS = s.system;
   const u = s.ustawienia;
-  if (s.polaczono) {
+  const opoznienie = s.ostatnie_sprawdzenie ? (Date.now() - Date.parse(s.ostatnie_sprawdzenie)) / 1000 : 0;
+  if (s.polaczono && opoznienie > Math.max(120, u.co_ile_sekund * 10)) {
+    pokazStan('warn', 'Sprawdzanie opóźnione', `Ostatnie sprawdzenie poczty: ${temu(s.ostatnie_sprawdzenie)}. Program ponawia połączenie.`);
+    check('c-poczta', 'warn', `${u.login} · sprawdzono ${temu(s.ostatnie_sprawdzenie)}`);
+  } else if (s.polaczono) {
     pokazStan('ok', 'Czuwa', 'Wszystko działa. Program reaguje na odrzucenia w ciągu kilku sekund.');
     check('c-poczta', 'ok', `${u.login} · sprawdzono ${temu(s.ostatnie_sprawdzenie)}`);
   } else if (!u.login || !s.ma_haslo) {
@@ -1213,7 +1465,10 @@ async function odswiez(){
     check('c-poczta', 'err', s.blad || 'Łączenie…');
   }
   const ch = s.skrypt_chrome && (Date.now() - Date.parse(s.skrypt_chrome)) < 36e5;
-  check('c-chrome', ch ? 'ok' : 'warn', ch ? `Połączony ${temu(s.skrypt_chrome)}` : 'Otwórz formularz rezerwacji w Chrome, aby sprawdzić');
+  const staryskrypt = ch && s.skrypt_wersja && s.skrypt_chrome_wersja !== s.skrypt_wersja;
+  if (!s.chrome) check('c-chrome', 'err', 'Nie znaleziono Google Chrome – zainstaluj go, formularz otworzy się w innej przeglądarce bez skryptu');
+  else if (staryskrypt) check('c-chrome', 'warn', `Nieaktualny skrypt – kliknij „Zainstaluj skrypt w Chrome” (wersja ${s.skrypt_wersja})`);
+  else check('c-chrome', ch ? 'ok' : 'warn', ch ? `Połączony ${temu(s.skrypt_chrome)}` : 'Otwórz formularz rezerwacji w Chrome, aby sprawdzić');
   check('c-telefon', u.telefon ? 'ok' : 'warn', u.telefon ? 'Włączone (ntfy)' : 'Wyłączone');
   check('c-autostart', s.autostart ? 'ok' : 'warn', s.autostart ? 'Uruchamia się z systemem' : 'Wyłączony');
 
@@ -1232,13 +1487,15 @@ async function odswiez(){
   document.querySelectorAll('.temat').forEach(el => el.textContent = u.ntfy_temat);
   if (qrTemat !== u.ntfy_temat && window.QRCode) {
     qrTemat = u.ntfy_temat; $('qr').innerHTML = '';
-    new QRCode($('qr'), {text: 'https://ntfy.sh/' + qrTemat, width: 160, height: 160});
+    new QRCode($('qr'), {text: u.ntfy_serwer.replace(/\/+$/, '') + '/' + qrTemat, width: 160, height: 160});
   }
 
   const rows = s.zdarzenia.map(z => z.typ === 'odrzucenie'
-    ? `<tr><td>${new Date(z.czas).toLocaleString('pl-PL')}</td><td><span class="tag err">Odrzucenie</span></td><td>${plData(z.data)}, ${esc(z.godzina)}</td><td>${esc(z.jezyk)} · ${esc(z.rodzaj)}${String(z.id).startsWith('proba') ? ' <span class="tag info">próba</span>' : ''}</td></tr>`
-    : `<tr><td>${new Date(z.czas).toLocaleString('pl-PL')}</td><td><span class="tag info">Inna</span></td><td>–</td><td>${esc(z.temat_maila)}</td></tr>`);
-  $('zdarzenia').innerHTML = rows.join('') || '<tr><td colspan="4" class="empty">Brak wiadomości od uruchomienia programu.</td></tr>';
+    ? `<tr><td>${new Date(z.czas).toLocaleString('pl-PL')}</td><td><span class="tag err">Odrzucenie</span></td><td>${plData(z.data)}, ${esc(z.godzina)}</td><td>${esc(z.jezyk)} · ${esc(z.rodzaj)}${String(z.id).startsWith('proba') ? ' <span class="tag info">próba</span>' : ''}</td>
+       <td><button class="link" data-otworz="${esc(z.id)}" title="Otwiera formularz w Chrome wypełniony tym terminem">Wypełnij ponownie</button></td></tr>`
+    : `<tr><td>${new Date(z.czas).toLocaleString('pl-PL')}</td><td><span class="tag info">Inna</span></td><td>${z.data ? plData(z.data) : '–'}</td><td>${esc(z.temat_maila)}</td><td></td></tr>`);
+  const html = rows.join('') || '<tr><td colspan="5" class="empty">Brak wiadomości od uruchomienia programu.</td></tr>';
+  if ($('zdarzenia').dataset.html !== html) { $('zdarzenia').innerHTML = html; $('zdarzenia').dataset.html = html; }
 
   if ($('log-box').open) {
     const l = await api('/api/log'); $('log').textContent = l.linie.join('') || 'Brak wpisów.';
@@ -1246,6 +1503,16 @@ async function odswiez(){
 }
 function pokazStan(klasa, tekst, opis){ $('stan').className = 'pill ' + klasa; $('stan-txt').textContent = tekst; $('stan-opis').textContent = opis; }
 
+$('zdarzenia').onclick = async e => {
+  const b = e.target.closest('[data-otworz]');
+  if (!b) return;
+  const r = await api('/api/otworz', {id: b.dataset.otworz});
+  if (!r.ok) alert(r.komunikat || 'Nie udało się otworzyć formularza.');
+};
+$('otworz-formularz').onclick = async () => {
+  const r = await api('/api/otworz', {});
+  if (!r.ok) alert(r.komunikat || 'Nie udało się otworzyć formularza.');
+};
 $('zapisz-poczta').onclick = async () => {
   const r = await api('/api/ustawienia', formularzPoczty());
   $('haslo').value = '';
@@ -1259,10 +1526,13 @@ $('sprawdz').onclick = async () => {
 };
 $('telefon-test').onclick = async () => {
   const r = await api('/api/telefon-test', {});
-  msg('msg-telefon', r.ok ? 'Wysłano. Powiadomienie powinno pojawić się na telefonie w ciągu kilku sekund.' : 'Nie udało się wysłać – sprawdź połączenie z internetem.', r.ok ? 'ok' : 'err');
+  msg('msg-telefon', r.ok ? 'Wysłano. Powiadomienie powinno pojawić się na telefonie w ciągu kilku sekund.' : (r.komunikat || 'Nie udało się wysłać – sprawdź połączenie z internetem.'), r.ok ? 'ok' : 'err');
 };
 document.querySelectorAll('[data-auto]').forEach(el => el.onchange = () => api('/api/ustawienia', {[el.id]: el.checked}).then(odswiez));
-document.querySelectorAll('[data-auto-val]').forEach(el => el.onchange = () => api('/api/ustawienia', {[el.id]: el.type === 'range' || el.id === 'powtorzenia' ? Number(el.value) : el.value}));
+document.querySelectorAll('[data-auto-val]').forEach(el => el.onchange = async () => {
+  const r = await api('/api/ustawienia', {[el.id]: el.type === 'range' || el.id === 'powtorzenia' ? Number(el.value) : el.value});
+  if (!r.ok) alert(r.komunikat || 'Nie udało się zapisać ustawienia.');
+});
 $('glosnosc').oninput = () => $('glosnosc-txt').textContent = $('glosnosc').value + '%';
 $('dzwiek-test').onclick = () => api('/api/dzwiek-test', {dzwiek: $('dzwiek').value, glosnosc: Number($('glosnosc').value)});
 $('proba').onclick = async () => {
@@ -1284,7 +1554,7 @@ $('odinstaluj').onclick = async () => {
 };
 $('log-box').addEventListener('toggle', odswiez);
 
-const d = new Date(); d.setDate(d.getDate() + 30); $('p-data').value = d.toISOString().slice(0, 10);
+$('p-data').value = dzisISO(30);
 odswiez(); setInterval(odswiez, 3000);
 </script>
 </body>
